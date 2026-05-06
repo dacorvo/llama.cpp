@@ -92,6 +92,7 @@ class ServerProcess:
     no_models_autoload: bool | None = None
     lora_files: List[str] | None = None
     enable_ctx_shift: int | None = False
+    n_cache_reuse: int | None = None
     spec_draft_n_min: int | None = None
     spec_draft_n_max: int | None = None
     no_webui: bool | None = None
@@ -214,6 +215,8 @@ class ServerProcess:
                 server_args.extend(["--lora", lora_file])
         if self.enable_ctx_shift:
             server_args.append("--context-shift")
+        if self.n_cache_reuse is not None:
+            server_args.extend(["--cache-reuse", self.n_cache_reuse])
         if self.api_key:
             server_args.extend(["--api-key", self.api_key])
         if self.spec_draft_n_max:

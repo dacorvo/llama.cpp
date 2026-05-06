@@ -77,6 +77,28 @@ enum server_state {
     SERVER_STATE_READY,          // Server is ready and model is loaded
 };
 
+// A splice scheduled by --cache-reuse. The cached chunk's cells live in a
+// temp sequence (offset by ``splice_pack_base``) until the prefill cursor
+// reaches ``head_p``, at which point the cells are moved into the slot at
+// their final position. Applying splices just-in-time keeps the slot's KV
+// contiguous from llama_decode's point of view (it requires Y = X + 1 on
+// each batch — see llama_batch_allocr::init).
+struct server_splice {
+    llama_pos head_c;   // donor-side position (untouched after snapshot)
+    llama_pos head_p;   // destination position in the recipient
+    llama_pos n_match;  // chunk size in tokens
+    bool      applied;  // becomes true once the cells have been moved into the slot
+};
+
+// Position offset used to "park" splice source cells in the temp seq at
+// values well above any plausible context length, so the seq_add we use to
+// land them at the destination doesn't accidentally hit other splices'
+// packed cells. Cells in the same stream share their position field across
+// all owning seqs, so the packed positions must be disjoint from both the
+// active recipient positions and from each other (which they trivially are
+// because each splice's head_c is unique by greedy search).
+constexpr llama_pos server_slot_splice_pack_base = 1 << 24;  // 16 M
+
 struct server_slot {
     int id;
 
@@ -110,6 +132,12 @@ struct server_slot {
 
     int32_t n_prompt_tokens_cache     = 0;
     int32_t n_prompt_tokens_processed = 0;
+
+    // Splices scheduled by --cache-reuse for the current request, sorted by
+    // head_p, non-overlapping. The cached source cells live in a temp seq
+    // until the prefill cursor reaches head_p, at which point the prefill
+    // loop applies the splice (moves cells into the slot) and skips ahead.
+    std::vector<server_splice> splice_pending;
 
     size_t last_nl_pos = 0;
 
@@ -197,6 +225,7 @@ struct server_slot {
         SLT_DBG(*this, "%s", "\n");
 
         n_prompt_tokens_cache = 0;
+        splice_pending.clear();
 
         last_nl_pos    = 0;
         generated_text = "";
@@ -2381,11 +2410,24 @@ private:
                                 }
 
                                 // reuse chunks from the cached prompt by shifting their KV cache in the new position
+                                //
+                                // Two-pointer symmetric scan: walk both head_c (cache) and head_p
+                                // (recipient) on miss. The legacy algorithm only advanced head_c,
+                                // so it could only find matches where the recipient's content past
+                                // CP was a contiguous suffix of the donor's — i.e. the recipient was
+                                // a "shorter version" of the donor (chat-history truncation, FIM
+                                // line-edit, etc., the cases issue #5793 designed for). In agent
+                                // workloads, the same chunk recurs in both donor and recipient with
+                                // divergent content surrounding it on both sides, so head_p needs to
+                                // advance past the divergent prefix to discover the chunk. Detected
+                                // splices that extend the contiguous prefix (head_p == n_past at
+                                // splice time) are applied directly and advance n_past, exactly as
+                                // before. Splices that land past a gap are recorded in
+                                // slot.splice_ranges and applied via a temp-sequence trampoline; the
+                                // prefill batch loop then skips those positions, leaving the spliced
+                                // KV in place.
                                 if (can_cache_reuse && n_cache_reuse > 0) {
                                     GGML_ASSERT(!slot.prompt.tokens.has_mtmd);
-
-                                    size_t head_c = n_past; // cache
-                                    size_t head_p = n_past; // current prompt
 
                                     if (mctx) {
                                         // we should never reach this
@@ -2394,40 +2436,127 @@ private:
 
                                     SLT_DBG(slot, "trying to reuse chunks with size > %d, n_past = %d\n", n_cache_reuse, n_past);
 
-                                    while (head_c < slot.prompt.tokens.size() &&
-                                           head_p < input_tokens.size()) {
+                                    struct splice_t { size_t head_c; size_t head_p; size_t n_match; };
+                                    std::vector<splice_t> splices;
 
-                                        size_t n_match = 0;
-                                        while (head_c + n_match < slot.prompt.tokens.size() &&
-                                               head_p + n_match < input_tokens.size()       &&
-                                               slot.prompt.tokens[head_c + n_match] == input_tokens[head_p + n_match]) {
-                                            n_match++;
+                                    // Two-pointer symmetric search.
+                                    size_t head_p     = n_past;
+                                    size_t head_c_min = n_past; // monotonic floor — splices appear in order in cache
+                                    while (head_p + (size_t) n_cache_reuse <= input_tokens.size()) {
+                                        // Find the first cache position >= head_c_min where a run of
+                                        // length >= n_cache_reuse starts that matches input at head_p.
+                                        // Greedy first-fit, matching the legacy algorithm's per-position
+                                        // selection.
+                                        size_t best_n  = 0;
+                                        size_t best_hc = 0;
+                                        for (size_t hc = head_c_min; hc < slot.prompt.tokens.size(); hc++) {
+                                            if (slot.prompt.tokens[hc] != input_tokens[head_p]) {
+                                                continue;
+                                            }
+                                            size_t n = 0;
+                                            while (hc + n     < slot.prompt.tokens.size() &&
+                                                   head_p + n < input_tokens.size()       &&
+                                                   slot.prompt.tokens[hc + n] == input_tokens[head_p + n]) {
+                                                n++;
+                                            }
+                                            if (n >= (size_t) n_cache_reuse) {
+                                                best_n  = n;
+                                                best_hc = hc;
+                                                break;
+                                            }
                                         }
 
-                                        if (n_match >= (size_t) n_cache_reuse) {
-                                            SLT_INF(slot, "reusing chunk with size %zu, shifting KV cache [%zu, %zu) -> [%zu, %zu)\n", n_match, head_c, head_c + n_match, head_p, head_p + n_match);
-                                            //for (size_t i = head_p; i < head_p + n_match; i++) {
-                                            //    SLT_DBG(slot, "cache token %3zu: %6d '%s'\n", i, prompt_tokens[i], common_token_to_piece(ctx, prompt_tokens[i]).c_str());
-                                            //}
-
-                                            const int64_t kv_shift = (int64_t) head_p - (int64_t) head_c;
-
-                                            llama_memory_seq_rm (llama_get_memory(ctx), slot.id, head_p, head_c);
-                                            llama_memory_seq_add(llama_get_memory(ctx), slot.id, head_c, head_c + n_match, kv_shift);
-
-                                            for (size_t i = 0; i < n_match; i++) {
-                                                slot.prompt.tokens.set_token(head_p + i, slot.prompt.tokens[head_c + i]);
-                                                n_past++;
-                                            }
-
-                                            head_c += n_match;
-                                            head_p += n_match;
+                                        if (best_n >= (size_t) n_cache_reuse) {
+                                            splices.push_back({best_hc, head_p, best_n});
+                                            head_c_min = best_hc + best_n;
+                                            head_p    += best_n;
                                         } else {
-                                            head_c += 1;
+                                            head_p++;
                                         }
                                     }
 
-                                    SLT_DBG(slot, "after context reuse, new n_past = %d\n", n_past);
+                                    SLT_DBG(slot, "found %zu candidate splice(s)\n", splices.size());
+
+                                    // Pick a sequence id outside the active slot range as a temp
+                                    // trampoline. The KV cache pre-allocates state for LLAMA_MAX_SEQ
+                                    // (currently 256) sequences regardless of how many slots are
+                                    // configured, so any seq id in [0, 256) is safely addressable by
+                                    // the seq_cp / seq_rm / seq_add API. We pick the top of that
+                                    // range (255). LLAMA_MAX_SEQ is not part of the public include
+                                    // path, so the constant is hard-coded here.
+                                    constexpr llama_seq_id splice_temp = 255;
+                                    // The temp seq id is in [0, LLAMA_MAX_SEQ=256), but the KV
+                                    // cache only allocates that many seq slots when the cache is
+                                    // unified (single stream). Non-unified caches resize
+                                    // seq_to_stream down to n_seq_max, which makes seq_id 255
+                                    // out-of-bounds and causes the seq_rm/seq_cp/seq_add API
+                                    // to assert. Gate the symmetric path on kv_unified — when
+                                    // off, fall back to the legacy contiguous-only regime.
+                                    const bool can_use_temp_seq        =
+                                        params_base.kv_unified && (slot.id != splice_temp);
+
+                                    // Snapshot every splice's source cells into the temp seq at
+                                    // packed (mutually-non-overlapping) positions, removing them
+                                    // from the slot. The cells stay alive via the temp tag and get
+                                    // moved into the slot at their destination position when the
+                                    // prefill cursor reaches that position (see the prefill batch
+                                    // loop further below). Deferring application keeps the slot's
+                                    // KV contiguous from llama_decode's point of view, which
+                                    // requires Y = X + 1 on every batch.
+                                    slot.splice_pending.clear();
+
+                                    if (!can_use_temp_seq) {
+                                        // No usable temp seq: fall back to the legacy contiguous-
+                                        // -only regime by applying splices in place at the splice
+                                        // boundary. Splices that don't extend the contiguous prefix
+                                        // are dropped silently — same effect as a memory backend
+                                        // that doesn't support shift.
+                                        for (const auto & s : splices) {
+                                            if (s.head_p != (size_t) n_past) continue;
+                                            const int64_t kv_shift = (int64_t) s.head_p - (int64_t) s.head_c;
+                                            SLT_INF(slot, "reusing chunk with size %zu, shifting KV cache [%zu, %zu) -> [%zu, %zu)\n",
+                                                    s.n_match, s.head_c, s.head_c + s.n_match, s.head_p, s.head_p + s.n_match);
+                                            if (kv_shift != 0) {
+                                                llama_memory_seq_rm (llama_get_memory(ctx), slot.id, s.head_p, s.head_c);
+                                                llama_memory_seq_add(llama_get_memory(ctx), slot.id, s.head_c, s.head_c + s.n_match, kv_shift);
+                                            }
+                                            for (size_t i = 0; i < s.n_match; i++) {
+                                                slot.prompt.tokens.set_token(s.head_p + i, input_tokens[s.head_p + i]);
+                                                n_past++;
+                                            }
+                                        }
+                                    } else if (!splices.empty()) {
+                                        // Make sure temp is empty before we use it.
+                                        llama_memory_seq_rm(llama_get_memory(ctx), splice_temp, -1, -1);
+
+                                        for (const auto & s : splices) {
+                                            // seq_cp same-stream tags the cells with the temp seq
+                                            // while leaving them tagged for the slot. The follow-up
+                                            // seq_rm then removes the slot's tag so the subsequent
+                                            // seq_add (positions become packed_base + head_c) does
+                                            // not drag slot-owned cells along — cells sharing a
+                                            // stream share their position field across all owning
+                                            // seqs.
+                                            llama_memory_seq_cp(llama_get_memory(ctx), slot.id, splice_temp,
+                                                                 s.head_c, s.head_c + s.n_match);
+                                            llama_memory_seq_rm(llama_get_memory(ctx), slot.id,
+                                                                 s.head_c, s.head_c + s.n_match);
+                                            llama_memory_seq_add(llama_get_memory(ctx), splice_temp,
+                                                                 s.head_c, s.head_c + s.n_match,
+                                                                 server_slot_splice_pack_base);
+                                            slot.splice_pending.push_back({
+                                                (llama_pos) s.head_c,
+                                                (llama_pos) s.head_p,
+                                                (llama_pos) s.n_match,
+                                                /*applied=*/false,
+                                            });
+                                            SLT_INF(slot, "scheduled splice: size %zu, KV cache [%zu, %zu) -> [%zu, %zu)\n",
+                                                    s.n_match, s.head_c, s.head_c + s.n_match, s.head_p, s.head_p + s.n_match);
+                                        }
+                                    }
+
+                                    SLT_DBG(slot, "after context reuse, n_past = %d, splice_pending = %zu\n",
+                                            n_past, slot.splice_pending.size());
                                 }
                             } else {
                                 // if we don't cache the prompt, we have to remove all previous tokens
@@ -2576,7 +2705,13 @@ private:
 
                     SLT_INF(slot, "n_tokens = %d, memory_seq_rm [%d, end)\n", slot.prompt.n_tokens(), p0);
 
-                    if (!llama_memory_seq_rm(llama_get_memory(ctx), slot.id, p0, -1)) {
+                    // The cache-reuse step above moved each splice's source cells
+                    // into the temp seq, so the slot has nothing past p0 except
+                    // donor leftovers we don't need any more. The full clear is
+                    // safe.
+                    bool seq_rm_ok = llama_memory_seq_rm(llama_get_memory(ctx), slot.id, p0, -1);
+
+                    if (!seq_rm_ok) {
                         SLT_WRN(slot, "failed to truncate tokens with position >= %d - clearing the memory\n", p0);
 
                         slot.prompt_clear(true);
@@ -2653,10 +2788,84 @@ private:
                             break;
                         }
 
+                        const llama_pos cur_pos = slot.prompt.tokens.pos_next();
+
+                        // If a --cache-reuse splice is scheduled to land at this
+                        // position, apply it now (or break out of the batch so
+                        // it can be applied on the next update_slots pass).
+                        // The engine requires every batch to start at the
+                        // cache's last_pos + 1, so a splice that lands past a
+                        // gap must be applied *between* batches: emit the
+                        // current gap batch first, then apply the splice on
+                        // the next entry. We detect "between batches" by the
+                        // current slot's batch being empty (n_tokens_prev ==
+                        // batch.n_tokens).
+                        bool applied_splice = false;
+                        bool stop_for_splice = false;
+                        for (auto & s : slot.splice_pending) {
+                            if (s.applied || s.head_p != cur_pos) continue;
+                            if (batch.n_tokens != n_tokens_prev) {
+                                // The current batch already has gap tokens
+                                // queued for this slot. Decode it first, then
+                                // apply the splice on the next pass.
+                                stop_for_splice = true;
+                                break;
+                            }
+                            // The model needs at least one token in the prefill
+                            // batch to produce logits (see [TAG_PROMPT_LOGITS]).
+                            // If applying the full splice would consume the
+                            // rest of the prompt and leave the batch empty,
+                            // hold back the last token so the batch.add path
+                            // below handles it.
+                            int n_to_apply = s.n_match;
+                            if (s.head_p + n_to_apply == (llama_pos) slot.task->n_tokens()) {
+                                n_to_apply -= 1;
+                            }
+                            if (n_to_apply <= 0) {
+                                // Splice would only have covered the held-back
+                                // token. Drop it and let the batch.add path do
+                                // the prefill normally.
+                                s.applied = true;
+                                break;
+                            }
+                            constexpr llama_seq_id splice_temp = 255;
+                            const llama_pos packed_lo = server_slot_splice_pack_base + s.head_c;
+                            const llama_pos packed_hi = packed_lo + n_to_apply;
+                            const llama_pos to_dest   = s.head_p - packed_lo;
+                            llama_memory_seq_add(llama_get_memory(ctx), splice_temp,
+                                                 packed_lo, packed_hi, to_dest);
+                            llama_memory_seq_cp (llama_get_memory(ctx), splice_temp, slot.id,
+                                                 s.head_p, s.head_p + n_to_apply);
+                            // Drop the temp tag so a later splice's seq_add on a
+                            // different packed range doesn't drag these cells.
+                            llama_memory_seq_rm (llama_get_memory(ctx), splice_temp,
+                                                 s.head_p, s.head_p + n_to_apply);
+                            s.applied = true;
+                            SLT_INF(slot, "reusing chunk with size %d, shifting KV cache [%d, %d) -> [%d, %d)\n",
+                                    n_to_apply, s.head_c, s.head_c + n_to_apply, s.head_p, s.head_p + n_to_apply);
+                            // Push the spliced tokens into slot.prompt.tokens so
+                            // the cursor advances past them and the next loop
+                            // iteration picks the right cur_tok. These tokens
+                            // were served by the splice, so they count toward
+                            // n_prompt_tokens_cache (not n_prompt_tokens_processed).
+                            for (int i = 0; i < n_to_apply; i++) {
+                                slot.prompt.tokens.push_back(input_tokens[s.head_p + i]);
+                            }
+                            slot.n_prompt_tokens_cache += n_to_apply;
+                            applied_splice = true;
+                            break;
+                        }
+                        if (stop_for_splice) {
+                            break;
+                        }
+                        if (applied_splice) {
+                            continue;
+                        }
+
                         // embedding requires all tokens in the batch to be output
                         common_batch_add(batch,
                             cur_tok,
-                            slot.prompt.tokens.pos_next(),
+                            cur_pos,
                             { slot.id },
                             slot.task->need_embd());
                         slot.prompt.tokens.push_back(cur_tok);
@@ -2691,6 +2900,16 @@ private:
                     // entire prompt has been processed
                     if (slot.prompt.n_tokens() == slot.task->n_tokens()) {
                         slot.state = SLOT_STATE_DONE_PROMPT;
+
+                        // Drop any leftover splice cells that the just-in-time
+                        // applier didn't consume (e.g. last-token holdback for
+                        // [TAG_PROMPT_LOGITS], or splices skipped because they
+                        // were too small after the holdback). Safe whether or
+                        // not the splice path was used — temp empty == no-op.
+                        if (params_base.kv_unified) {
+                            constexpr llama_seq_id splice_temp = 255;
+                            llama_memory_seq_rm(llama_get_memory(ctx), splice_temp, -1, -1);
+                        }
 
                         GGML_ASSERT(batch.n_tokens > 0);
 
