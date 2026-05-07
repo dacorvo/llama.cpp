@@ -410,7 +410,9 @@ public:
     // pos[i] = pos[i] + d
     // sets "has_shift" to true
     // note: call only if the cell is not empty
-    bool pos_add(uint32_t i, llama_pos d) {
+    // when shift_ext is true, also advance ext.x and ext.y by d — used by IM-RoPE / M-RoPE
+    // K-shift on text-only cells where ext.{x,y} carry the same temporal axis value as pos.
+    bool pos_add(uint32_t i, llama_pos d, bool shift_ext = false) {
         assert(i < pos.size());
         assert(pos[i] != -1);
 
@@ -419,12 +421,18 @@ public:
         pos[i]   += d;
         shift[i] += d;
 
+        if (shift_ext) {
+            ext[i].x += d;
+            ext[i].y += d;
+        }
+
         has_shift = true;
 
         if (pos[i] < 0) {
             seq[i].reset();
             pos[i] = -1;
             shift[i] = 0;
+            ext[i].reset();
 
             used.erase(i);
 

@@ -257,6 +257,80 @@ int main(int /*argc*/, const char ** /*argv*/) {
         }
     }
 
+    // IMROPE text-only K-shift mathematical correctness
+    // ref: tools/server/notes/IM_ROPE_SHIFT_INVESTIGATION.md (phase 4)
+    //
+    // Forward IMROPE on text-only inputs writes positions as
+    // (t, t, t, 0) per token (3 t-axes + a constant w-axis at 0).
+    // To shift cell from t to t+δ we apply a second rope_multi with
+    // positions (δ, δ, δ, 0). 2D rotations compose additively, so:
+    //
+    //   rope_multi(rope_multi(x, p_init), p_shift) ≡ rope_multi(x, p_full)
+    //
+    // where p_init = (t,t,t,0), p_shift = (δ,δ,δ,0), p_full = (t+δ,t+δ,t+δ,0).
+    // This locks down the math the K-shift relies on.
+    {
+        const int ndims = 4;
+        const int64_t n_rot = 128;
+        const int64_t ne[4] = { 2*n_rot, 32, 73, 1 };
+
+        const int n_past_0 = 100;
+        const int delta    = -67;             // shift; can be negative (e.g. cache-reuse splice)
+        int sections[4]    = { 16, 24, 24, 0 }; // text-only IMROPE: t/h/w real, 4th unused
+
+        struct ggml_tensor * x = get_random_tensor_f32(ctx0, ndims, ne, -1.0f, 1.0f);
+
+        struct ggml_tensor * p_init  = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ne[2]*4);
+        struct ggml_tensor * p_shift = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ne[2]*4);
+        struct ggml_tensor * p_full  = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ne[2]*4);
+
+        for (int i = 0; i < ne[2]; ++i) {
+            const int t = n_past_0 + i;
+            for (int j = 0; j < 3; ++j) {
+                ((int32_t *) p_init->data )[i + ne[2]*j] = t;
+                ((int32_t *) p_shift->data)[i + ne[2]*j] = delta;
+                ((int32_t *) p_full->data )[i + ne[2]*j] = t + delta;
+            }
+            ((int32_t *) p_init->data )[i + ne[2]*3] = 0;
+            ((int32_t *) p_shift->data)[i + ne[2]*3] = 0;
+            ((int32_t *) p_full->data )[i + ne[2]*3] = 0;
+        }
+
+        const int mode = GGML_ROPE_TYPE_IMROPE;
+
+        struct ggml_tensor * r0 = ggml_rope_multi(
+            ctx0, x,  p_init,  nullptr, n_rot, sections, mode, 32768, 1000000, 1, 0, 1, 32, 1);
+        struct ggml_tensor * r1 = ggml_rope_multi(
+            ctx0, r0, p_shift, nullptr, n_rot, sections, mode, 32768, 1000000, 1, 0, 1, 32, 1);
+        struct ggml_tensor * r2 = ggml_rope_multi(
+            ctx0, x,  p_full,  nullptr, n_rot, sections, mode, 32768, 1000000, 1, 0, 1, 32, 1);
+
+        ggml_cgraph * gf = ggml_new_graph(ctx0);
+        ggml_build_forward_expand(gf, r1);
+        ggml_build_forward_expand(gf, r2);
+        ggml_graph_compute_helper(work_buffer, gf, 4);
+
+        double sum0 = 0.0, sum1 = 0.0, diff = 0.0;
+        const float * r1_data = (float *) r1->data;
+        const float * r2_data = (float *) r2->data;
+        const int n_elements = ggml_nelements(r1);
+        for (int i = 0; i < n_elements; ++i) {
+            sum0 += fabs(r1_data[i]);
+            sum1 += fabs(r2_data[i]);
+            diff += fabs(r1_data[i] - r2_data[i]);
+        }
+
+        printf("imrope text-shift: mode=%d delta=%d\n", mode, delta);
+        printf("  sum0: %f\n", sum0);
+        printf("  sum1: %f\n", sum1);
+        printf("  diff: %f\n", diff);
+        printf("  rel err: %f\n", diff / sum0);
+        printf("  rel err: %f\n", diff / sum1);
+
+        GGML_ASSERT(diff / sum0 < 0.0001f);
+        GGML_ASSERT(diff / sum1 < 0.0001f);
+    }
+
     ggml_free(ctx0);
 
     return 0;

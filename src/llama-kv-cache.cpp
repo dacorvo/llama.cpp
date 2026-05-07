@@ -514,13 +514,29 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
 
 void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
-    GGML_ASSERT(hparams.n_pos_per_embd() == 1 && "seq_add() is only supported for n_pos_per_embd() == 1");
 
     auto & cells = v_cells[seq_to_stream[seq_id]];
     auto & head  = v_heads[seq_to_stream[seq_id]];
 
     if (shift == 0) {
         return;
+    }
+
+    // For IM-RoPE / M-RoPE we only support seq_add on text-only cells (ext.x == ext.y == pos).
+    // Image cells carry distinct 2D spatial positions in ext.{x,y}; shifting their temporal axis
+    // without breaking image positions would require per-axis tracking we don't have.
+    // ref: tools/server/notes/IM_ROPE_SHIFT_INVESTIGATION.md
+    const bool multi_axis = hparams.n_pos_per_embd() > 1;
+    if (multi_axis) {
+        for (uint32_t i = 0; i < cells.size(); ++i) {
+            if (cells.is_empty(i)) continue;
+            if (!cells.pos_in(i, p0, p1)) continue;
+            if (!cells.seq_has(i, seq_id)) continue;
+            const auto pos = cells.pos_get(i);
+            const auto & ext = cells.ext_get(i);
+            GGML_ASSERT((ext.x == pos && ext.y == pos) &&
+                        "seq_add(): cell carries non-temporal ext (image cell) — refuse shift");
+        }
     }
 
     uint32_t new_head = cells.size();
@@ -544,7 +560,7 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
         }
 
         if (cells.seq_has(i, seq_id)) {
-            if (cells.pos_add(i, shift)) {
+            if (cells.pos_add(i, shift, /*shift_ext=*/multi_axis)) {
                 if (new_head == cells.size()) {
                     new_head = i;
                 }
@@ -1093,7 +1109,29 @@ bool llama_kv_cache::get_can_shift() const {
         return false;
     }
     if (hparams.n_pos_per_embd() > 1) {
-        return false;
+        // IM-RoPE / M-RoPE: K-shift is supported for the text-only layout
+        // (forward writes positions as (t,t,t,0) per token — see
+        // llm_graph_input_pos::set_input). Image cells carry 2D spatial
+        // positions in ext.{x,y}; we refuse shift if any used cell has them.
+        // ref: tools/server/notes/IM_ROPE_SHIFT_INVESTIGATION.md
+        const auto rt = hparams.rope_type;
+        if (rt != LLAMA_ROPE_TYPE_MROPE && rt != LLAMA_ROPE_TYPE_IMROPE) {
+            return false;
+        }
+        // Text-only invariant: forward writes (t,t,t,0); cells store pos = t,
+        // ext.x = pos[i + 2*n_tokens] = t, ext.y = pos[i + n_tokens] = t.
+        // Image cells carry distinct (h, w) in ext, so ext.{x,y} != pos[i].
+        for (uint32_t s = 0; s < n_stream; ++s) {
+            const auto & cells = v_cells[s];
+            for (uint32_t i = 0; i < cells.size(); ++i) {
+                if (cells.is_empty(i)) continue;
+                const auto pos = cells.pos_get(i);
+                const auto & ext = cells.ext_get(i);
+                if (ext.x != pos || ext.y != pos) {
+                    return false;
+                }
+            }
+        }
     }
     return true;
 }
@@ -1406,11 +1444,25 @@ void llama_kv_cache::set_input_k_shift(ggml_tensor * dst) const {
 
     int32_t * data = (int32_t *) dst->data;
 
-    for (uint32_t s = 0; s < n_stream; ++s) {
-        const auto & cells = v_cells[s];
+    const uint32_t n_axes = hparams.n_pos_per_embd();
+    const uint32_t kvz    = v_cells[0].size();
 
-        for (uint32_t i = 0; i < cells.size(); ++i) {
-            data[s*cells.size() + i] = cells.is_empty(i) ? 0 : cells.get_shift(i);
+    // Axis-major layout matching ggml_rope_multi's expected position tensor
+    // (see ggml/src/ggml-cuda/rope.cu:231-251). For text-only IM-RoPE/M-RoPE
+    // the prefill layout is (t,t,t,0); the matching shift is (δ,δ,δ,0).
+    // For scalar RoPE (n_axes == 1) this is equivalent to the original
+    // single-axis fill.
+    for (uint32_t a = 0; a < n_axes; ++a) {
+        for (uint32_t s = 0; s < n_stream; ++s) {
+            const auto & cells = v_cells[s];
+
+            for (uint32_t i = 0; i < kvz; ++i) {
+                llama_pos val = 0;
+                if (!cells.is_empty(i) && a < 3) {
+                    val = cells.get_shift(i);
+                }
+                data[(size_t) a*kvz*n_stream + s*kvz + i] = val;
+            }
         }
     }
 }
@@ -1735,15 +1787,38 @@ ggml_tensor * llama_kv_cache::build_rope_shift(
     const auto & yarn_beta_slow   = cparams.yarn_beta_slow;
     const auto & yarn_attn_factor = cparams.yarn_attn_factor;
 
-    const auto & n_rot     = hparams.n_rot(il);
-    const auto & rope_type = hparams.rope_type == LLAMA_ROPE_TYPE_MROPE || hparams.rope_type == LLAMA_ROPE_TYPE_IMROPE
-                                // @ngxson : this is a workaround
-                                // for M-RoPE, we want to rotate the whole vector when doing KV shift
-                                // a normal RoPE should work, we just need to use the correct ordering
-                                // ref: https://github.com/ggml-org/llama.cpp/pull/13870
-                                ? LLAMA_ROPE_TYPE_NEOX
-                                : hparams.rope_type;
+    const auto & n_rot          = hparams.n_rot(il);
+    const auto & rope_type      = hparams.rope_type;
+    const auto   n_pos_per_embd = hparams.n_pos_per_embd();
     ggml_tensor * tmp;
+
+    if (n_pos_per_embd > 1) {
+        // IM-RoPE / M-RoPE shift: same op as forward, with a per-axis delta
+        // tensor (δ,δ,δ,0). 2D rotations compose additively, so applying a
+        // second ggml_rope_multi with this delta lifts every cell from
+        // forward position (t,t,t,0) to (t+δ,t+δ,t+δ,0). Gated upstream by
+        // get_can_shift, which ensures cells were prefilled with the
+        // text-only layout (no image positions in ext.{x,y}).
+        // ref: tools/server/notes/IM_ROPE_SHIFT_INVESTIGATION.md
+        int sections[GGML_MROPE_SECTIONS];
+        std::copy(hparams.rope_sections.begin(),
+                  hparams.rope_sections.begin() + GGML_MROPE_SECTIONS, sections);
+
+        if (ggml_is_quantized(cur->type)) {
+            tmp = ggml_cast(ctx, cur, GGML_TYPE_F32);
+            tmp = ggml_mul_mat_aux(ctx, tmp, rot);
+            tmp = ggml_rope_multi(ctx, tmp,
+                    shift, factors, n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+                    yarn_ext_factor, yarn_attn_factor, yarn_beta_fast, yarn_beta_slow);
+            tmp = ggml_mul_mat_aux(ctx, tmp, rot);
+            tmp = ggml_cpy(ctx, tmp, cur);
+        } else {
+            tmp = ggml_rope_multi_inplace(ctx, cur,
+                    shift, factors, n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+                    yarn_ext_factor, yarn_attn_factor, yarn_beta_fast, yarn_beta_slow);
+        }
+        return tmp;
+    }
 
     if (ggml_is_quantized(cur->type)) {
         // dequantize to f32 -> RoPE -> quantize back
@@ -1803,7 +1878,8 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
 
     auto inp = std::make_unique<llm_graph_input_k_shift>(this);
 
-    inp->k_shift = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, (int64_t) get_size()*n_stream);
+    inp->k_shift = ggml_new_tensor_1d(ctx, GGML_TYPE_I32,
+                                      (int64_t) get_size()*n_stream*hparams.n_pos_per_embd());
     ggml_set_input(inp->k_shift);
 
     inp->k_rot = build_input_k_rot(ctx);
