@@ -2762,9 +2762,19 @@ private:
                                                                 other.id, best_n, best_hc, best_hc + best_n, head_p_x, head_p_x + best_n);
                                                         head_p_x += best_n;
                                                     } else {
-                                                        SLT_WRN(slot, "seq_cp_deep returned %u (wanted %zu) — skipping cross-slot splice from slot %d at hc=%zu\n",
+                                                        SLT_WRN(slot, "seq_cp_deep returned %u (wanted %zu) — skipping cross-slot splice from slot %d at hc=%zu (likely cell pool exhausted)\n",
                                                                 n_cells, best_n, other.id, best_hc);
-                                                        head_p_x++;
+                                                        // Advance past this chunk wholesale rather than by 1.
+                                                        // Without this, the next iteration of the outer
+                                                        // scan finds the same chunk minus one token, retries
+                                                        // seq_cp_deep, fails for the same reason, and burns
+                                                        // O(input × chunk_size) time before terminating.
+                                                        // Likewise, if seq_cp_deep failed because the pool is
+                                                        // full, no other donor's chunk at any later head_p_x
+                                                        // can be placed either, so we may as well stop the
+                                                        // outer scan for this donor.
+                                                        head_p_x += best_n;
+                                                        break;
                                                     }
                                                 } else {
                                                     head_p_x++;
