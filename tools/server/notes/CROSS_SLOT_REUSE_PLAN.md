@@ -86,30 +86,68 @@ shared prefix.
 
 **Effort:** ~80 lines, one day.
 
-### Step 3 — Cross-slot symmetric scan
+### Step 3 — Cross-slot symmetric scan (BLOCKED on deep-copy primitive)
 
-After own-slot symmetric scan, also scan **other slots'**
-`prompt.tokens` for chunks matching the input past CP. For each
-match in slot S at positions `[hc_S, hc_S + n)` → recipient position
-`head_p`:
+**Status:** prototyped, reverted. Blocked on a missing memory-module
+primitive.
 
-- `seq_cp(S.id, splice_temp=255, hc_S, hc_S + n)` (snapshot into temp
-  trampoline)
-- `seq_rm(S.id, hc_S, hc_S + n)` is **not done** here — the donor
-  slot keeps its cells; only a *copy* lands in temp.
-- Apply path runs as today: `seq_add(temp shift to dest)` →
-  `seq_cp(temp, this.id, head_p, head_p + n)` → `seq_rm(temp, ...)`.
+The intent was: after own-slot symmetric scan, also scan **other
+slots'** `prompt.tokens` for chunks matching the input past CP, and
+for each match `seq_cp` the donor's cells into the splice temp
+trampoline as today's intra-slot path does.
 
-Same pos-min gate applies per source slot. Same slow-path threshold
-gate.
+What stops it from being safely shippable:
 
-**Validation:** captured (donor session A, recipient session B) pair
-with ≥1 known recurring chunk ≥ `n_cache_reuse`. Warm slot 0 with
-donor's last turn, route recipient to slot 1 (forced by LRU). Confirm
-splice events fire, cells transit A → temp → 1, no `Invalid input
-batch`, recipient continuation matches cold.
+Under `--kv-unified`, all seq ids share a single underlying cell
+pool. Same-stream `seq_cp(src, dst, p0, p1)` is **tag-additive**,
+not data-copy — it just adds `dst` to the cells' seq bitmask. To
+get the cells to the recipient's position the splice has to
+positionally shift them via `seq_add(splice_temp, ..., +base)`. The
+shift would corrupt the donor's view (donor still has its tag on
+cells now at packed positions ~16M+, so the donor's `seq_pos_max`
+jumps into the packed range), so the splice path is forced to
+`seq_rm(donor.id, ...)` before the shift. After that, the donor's
+seq has a **hole** at `[head_c, head_c + n)`.
 
-**Effort:** ~150 lines, two days.
+`pos_min` doesn't catch the hole — pos_min is the *minimum*
+position with cells, and the donor still has cells at `[0, head_c)`
+and `[head_c+n, end)`, so `pos_min = 0`. The standard CP path
+doesn't validate cell liveness either, only token equality. So the
+donor's next request — typically a continuation of the donor's own
+session — would compute `n_past = M > head_c` from token match,
+treat all cells `[0, M)` as live, then crash on attention when it
+hits the hole.
+
+CP is the most valuable cache primitive for TTFT. Breaking it on
+the donor every time a sibling slot does a cross-slot splice is
+unshippable.
+
+**Unblockers:**
+
+1. Add a `seq_cp_deep(src, dst, p0, p1, dst_offset)` primitive to
+   `llama-kv-cache.cpp` for the unified case. This would allocate
+   fresh cells, copy K and V tensors from the source, RoPE-rephase
+   K to the destination positions, and tag the new cells with the
+   destination seq id. The source cells stay untouched and the
+   donor's CP keeps working. ~300-500 lines in the memory module
+   plus the splice-path integration.
+
+2. Or run with non-unified KV so each slot is its own stream and
+   the cross-stream `seq_cp` (llama-kv-cache.cpp:462+) deep-copies
+   on its own. But the splice-temp trampoline relies on seq id 255
+   being addressable, which only works in unified mode — we'd have
+   to rework that, plus pay extra memory for per-stream cell pools.
+
+Option 1 is the right foundation: it's the same primitive rung 4
+(persistent disk-backed pool) will need to hydrate cells back into
+GPU KV at boot. Step 3 reopens once that lands.
+
+**What ships from this step in the meantime:** nothing. The
+revert keeps cross-slot CP (step 2, non-destructive) as the only
+cross-slot mechanism. Step 4 (hash index) can still proceed — its
+benefit applies to the own-slot symmetric scan that already
+exists, plus to step-2-style cross-slot CP, plus to whatever
+unblocked step 3 looks like.
 
 ### Step 4 — Rolling-hash index for the slot pool
 
