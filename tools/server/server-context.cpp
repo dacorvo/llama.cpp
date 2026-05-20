@@ -688,6 +688,130 @@ struct server_metrics {
 
 
 //
+// Cross-slot k-gram index. Drops the cross-slot symmetric scan from
+// O(input × Σ donor_size) to O(input × candidates_per_kgram). Each
+// slot's ``prompt.tokens`` contributes one entry per k-gram (k = 16
+// tokens); on the recipient side, every input position does one hash
+// lookup and walks the (typically small) candidate list to find a
+// non-trivial match. Hash collisions are filtered by an exact 16-token
+// recompare before the match is extended.
+//
+struct server_kgram_index {
+    static constexpr size_t K = 16;
+
+    struct entry {
+        int32_t  slot_id;
+        uint32_t pos;
+    };
+
+    // hash -> all (slot_id, position) pairs whose k-gram at ``position``
+    // hashes to this value. Both unique-slot and same-slot duplicates
+    // are kept (a k-gram repeating within one slot's history is a
+    // valid donor for the recipient).
+    std::unordered_map<uint64_t, std::vector<entry>> map;
+
+    // Per-slot record of (size, has_mtmd) at the last refresh, so the
+    // next refresh can detect that this slot needs rebuilding.
+    struct slot_state {
+        size_t   last_indexed_size = 0;
+        bool     has_mtmd          = false;
+    };
+    std::vector<slot_state> slot_states;
+
+    // Per-slot record of the hashes we inserted (indexed by position).
+    // Used to remove this slot's entries from ``map`` cheaply on drop.
+    std::vector<std::vector<uint64_t>> slot_hashes;
+
+    static uint64_t hash_kgram(const llama_token * tokens) {
+        // FNV-1a 64-bit over the byte representation of K tokens.
+        uint64_t h = 0xcbf29ce484222325ull;
+        const uint8_t * p = reinterpret_cast<const uint8_t *>(tokens);
+        for (size_t i = 0; i < K * sizeof(llama_token); i++) {
+            h ^= p[i];
+            h *= 0x100000001b3ull;
+        }
+        return h;
+    }
+
+    void ensure_capacity(int32_t slot_id) {
+        const size_t n = (size_t) slot_id + 1;
+        if (slot_states.size() < n) slot_states.resize(n);
+        if (slot_hashes.size() < n) slot_hashes.resize(n);
+    }
+
+    // Drop every entry for ``slot_id`` from ``map``.
+    void drop_slot(int32_t slot_id) {
+        ensure_capacity(slot_id);
+        auto & owned = slot_hashes[slot_id];
+        for (uint32_t pos = 0; pos < owned.size(); pos++) {
+            const uint64_t h = owned[pos];
+            auto it = map.find(h);
+            if (it == map.end()) continue;
+            auto & vec = it->second;
+            vec.erase(std::remove_if(vec.begin(), vec.end(),
+                [slot_id, pos](const entry & e) {
+                    return e.slot_id == slot_id && e.pos == pos;
+                }), vec.end());
+            if (vec.empty()) map.erase(it);
+        }
+        owned.clear();
+        slot_states[slot_id] = {};
+    }
+
+    // Rebuild ``slot_id``'s entries from ``toks`` (full re-index).
+    void rebuild_slot(int32_t slot_id, const server_tokens & toks) {
+        ensure_capacity(slot_id);
+        drop_slot(slot_id);
+        if (toks.has_mtmd) {
+            slot_states[slot_id] = {toks.size(), true};
+            return;
+        }
+        const size_t n = toks.size();
+        if (n < K) {
+            slot_states[slot_id] = {n, false};
+            return;
+        }
+        auto & owned = slot_hashes[slot_id];
+        owned.resize(n - K + 1, 0);
+        // Build a contiguous llama_token buffer (server_tokens may
+        // be backed by a non-contiguous mtmd-aware container).
+        std::vector<llama_token> buf(n);
+        for (size_t i = 0; i < n; i++) buf[i] = toks[i];
+        for (uint32_t pos = 0; pos + K <= n; pos++) {
+            const uint64_t h = hash_kgram(buf.data() + pos);
+            map[h].push_back({slot_id, pos});
+            owned[pos] = h;
+        }
+        slot_states[slot_id] = {n, false};
+    }
+
+    // Refresh every slot whose prompt.tokens size or has_mtmd flag has
+    // changed since the last refresh.
+    template <typename SlotsT>
+    void refresh(const SlotsT & slots) {
+        for (const auto & s : slots) {
+            ensure_capacity(s.id);
+            const auto & st = slot_states[s.id];
+            if (st.last_indexed_size != s.prompt.tokens.size() ||
+                st.has_mtmd          != s.prompt.tokens.has_mtmd) {
+                rebuild_slot(s.id, s.prompt.tokens);
+            }
+        }
+    }
+
+    // Lookup candidates whose k-gram matches input[head_p..head_p+K).
+    // Returns nullptr if no candidates. The returned pointer is valid
+    // only until the next refresh/rebuild call.
+    const std::vector<entry> * lookup(const llama_token * input) const {
+        const uint64_t h = hash_kgram(input);
+        auto it = map.find(h);
+        if (it == map.end()) return nullptr;
+        return &it->second;
+    }
+};
+
+
+//
 // server_context_impl (private implementation)
 //
 
@@ -741,6 +865,11 @@ private:
 
     // slots / clients
     std::vector<server_slot> slots;
+
+    // Server-wide k-gram index. Maintained lazily at the start of the
+    // cross-slot symmetric scan (rebuilt for any slot whose
+    // ``prompt.tokens.size()`` has changed since the last scan).
+    server_kgram_index kgram_index;
 
     int trace = 0;
     int slots_debug = 0;
@@ -2704,81 +2833,108 @@ private:
                                             }
                                         }
 
-                                        for (server_slot & other : slots) {
-                                            if (&other == &slot)              continue;
-                                            if (other.is_processing())        continue;
-                                            if (other.prompt.tokens.empty())  continue;
-                                            if (other.prompt.tokens.has_mtmd) continue;
+                                        // Refresh the server-wide k-gram index so all other
+                                        // slots' prompt.tokens are queryable in O(1) per input
+                                        // position. Replaces the prior O(R × Σ donor_size) nested
+                                        // scan with O(R × candidates_per_kgram) — typically a
+                                        // handful of candidates per hash bucket.
+                                        kgram_index.refresh(slots);
 
-                                            const llama_pos donor_pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx), other.id);
-                                            const size_t    donor_size    = other.prompt.tokens.size();
-                                            const size_t    donor_hc_min  = donor_pos_min > 0 ? (size_t) donor_pos_min : 0;
+                                        // Materialise input into a contiguous buffer once; the
+                                        // hash lookups below address it by pointer arithmetic.
+                                        std::vector<llama_token> input_buf(input_tokens.size());
+                                        for (size_t i = 0; i < input_tokens.size(); i++) {
+                                            input_buf[i] = input_tokens[i];
+                                        }
 
-                                            size_t head_p_x = (size_t) n_past;
-                                            while (head_p_x + (size_t) n_cache_reuse <= input_tokens.size()) {
-                                                if (input_covered[head_p_x]) { head_p_x++; continue; }
+                                        constexpr size_t K_KGRAM = server_kgram_index::K;
+                                        bool stop_cross_scan = false;
+                                        size_t head_p_x = (size_t) n_past;
+                                        while (!stop_cross_scan &&
+                                               head_p_x + (size_t) n_cache_reuse <= input_tokens.size() &&
+                                               head_p_x + K_KGRAM <= input_tokens.size()) {
+                                            if (input_covered[head_p_x]) { head_p_x++; continue; }
 
-                                                size_t best_n  = 0;
-                                                size_t best_hc = 0;
-                                                for (size_t hc = donor_hc_min; hc < donor_size; hc++) {
-                                                    if (other.prompt.tokens[hc] != input_tokens[head_p_x]) continue;
-                                                    size_t n = 0;
-                                                    while (hc       + n < donor_size               &&
-                                                           head_p_x + n < input_tokens.size()      &&
-                                                           !input_covered[head_p_x + n]            &&
-                                                           other.prompt.tokens[hc + n] == input_tokens[head_p_x + n]) {
-                                                        n++;
+                                            const auto * cands = kgram_index.lookup(input_buf.data() + head_p_x);
+                                            if (!cands || cands->empty()) { head_p_x++; continue; }
+
+                                            size_t  best_n       = 0;
+                                            size_t  best_hc      = 0;
+                                            int32_t best_slot_id = -1;
+
+                                            for (const auto & cand : *cands) {
+                                                if (cand.slot_id == slot.id)                  continue;
+                                                if (cand.slot_id < 0)                         continue;
+                                                if ((size_t) cand.slot_id >= slots.size())    continue;
+                                                server_slot & other = slots[cand.slot_id];
+                                                if (other.is_processing())                    continue;
+                                                if (other.prompt.tokens.empty())              continue;
+                                                if (other.prompt.tokens.has_mtmd)             continue;
+                                                if ((size_t) cand.pos + K_KGRAM > other.prompt.tokens.size()) continue;
+
+                                                // Hash collision guard: exact-match the K-gram.
+                                                bool ok = true;
+                                                for (size_t i = 0; i < K_KGRAM; i++) {
+                                                    if (other.prompt.tokens[cand.pos + i] != input_tokens[head_p_x + i]) {
+                                                        ok = false; break;
                                                     }
-                                                    if (n >= (size_t) n_cache_reuse) { best_n = n; best_hc = hc; break; }
                                                 }
+                                                if (!ok) continue;
 
-                                                if (best_n >= (size_t) n_cache_reuse) {
-                                                    // Park the donor's matching cells in the trampoline seq
-                                                    // (TEMP_SEQ=255) at packed positions, exactly like the
-                                                    // intra-slot symmetric path does — except we use
-                                                    // seq_cp_deep so the donor's cells stay intact at their
-                                                    // original positions (its CP is preserved). The cursor
-                                                    // handler below applies the splice (seq_add + seq_cp +
-                                                    // seq_rm) at head_p just like for intra-slot splices.
-                                                    constexpr llama_seq_id splice_temp = 255;
-                                                    const llama_pos pack_offset = (llama_pos) server_slot_splice_pack_base;
-                                                    const uint32_t n_cells = llama_memory_seq_cp_deep(
-                                                        llama_get_memory(ctx), other.id, splice_temp,
-                                                        (llama_pos) best_hc, (llama_pos) (best_hc + best_n),
-                                                        pack_offset);
-                                                    if (n_cells > 0 && (size_t) n_cells == best_n) {
-                                                        server_splice sp{};
-                                                        sp.head_c         = (llama_pos) best_hc;
-                                                        sp.head_p         = (llama_pos) head_p_x;
-                                                        sp.n_match        = (llama_pos) best_n;
-                                                        sp.applied        = false;
-                                                        sp.donor_slot_id  = other.id;
-                                                        sp.pre_applied    = false;  // use the standard trampoline cursor path
-                                                        slot.splice_pending.push_back(sp);
-                                                        for (size_t i = 0; i < best_n; i++) {
-                                                            input_covered[head_p_x + i] = true;
-                                                        }
-                                                        SLT_INF(slot, "cross-slot splice from slot %d: size %zu, donor KV [%zu, %zu) -> recipient [%zu, %zu) (parked in TEMP_SEQ)\n",
-                                                                other.id, best_n, best_hc, best_hc + best_n, head_p_x, head_p_x + best_n);
-                                                        head_p_x += best_n;
-                                                    } else {
-                                                        SLT_WRN(slot, "seq_cp_deep returned %u (wanted %zu) — skipping cross-slot splice from slot %d at hc=%zu (likely cell pool exhausted)\n",
-                                                                n_cells, best_n, other.id, best_hc);
-                                                        // Advance past this chunk wholesale rather than by 1.
-                                                        // Without this, the next iteration of the outer
-                                                        // scan finds the same chunk minus one token, retries
-                                                        // seq_cp_deep, fails for the same reason, and burns
-                                                        // O(input × chunk_size) time before terminating.
-                                                        // Likewise, if seq_cp_deep failed because the pool is
-                                                        // full, no other donor's chunk at any later head_p_x
-                                                        // can be placed either, so we may as well stop the
-                                                        // outer scan for this donor.
-                                                        head_p_x += best_n;
-                                                        break;
+                                                // pos_min eviction guard: the donor may have lost
+                                                // low-position cells (SWA window slide, n_ctx
+                                                // pressure) — the index keeps stale entries until
+                                                // the slot's next refresh.
+                                                const llama_pos donor_pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx), other.id);
+                                                if ((llama_pos) cand.pos < donor_pos_min) continue;
+
+                                                // Extend forward past the verified K-gram.
+                                                size_t n = K_KGRAM;
+                                                while (cand.pos + n < other.prompt.tokens.size() &&
+                                                       head_p_x + n < input_tokens.size()        &&
+                                                       !input_covered[head_p_x + n]              &&
+                                                       other.prompt.tokens[cand.pos + n] == input_tokens[head_p_x + n]) {
+                                                    n++;
+                                                }
+                                                if (n >= (size_t) n_cache_reuse && n > best_n) {
+                                                    best_n       = n;
+                                                    best_hc      = cand.pos;
+                                                    best_slot_id = cand.slot_id;
+                                                }
+                                            }
+
+                                            if (best_n >= (size_t) n_cache_reuse) {
+                                                server_slot & other = slots[best_slot_id];
+                                                constexpr llama_seq_id splice_temp = 255;
+                                                const llama_pos pack_offset = (llama_pos) server_slot_splice_pack_base;
+                                                const uint32_t n_cells = llama_memory_seq_cp_deep(
+                                                    llama_get_memory(ctx), other.id, splice_temp,
+                                                    (llama_pos) best_hc, (llama_pos) (best_hc + best_n),
+                                                    pack_offset);
+                                                if (n_cells > 0 && (size_t) n_cells == best_n) {
+                                                    server_splice sp{};
+                                                    sp.head_c         = (llama_pos) best_hc;
+                                                    sp.head_p         = (llama_pos) head_p_x;
+                                                    sp.n_match        = (llama_pos) best_n;
+                                                    sp.applied        = false;
+                                                    sp.donor_slot_id  = other.id;
+                                                    sp.pre_applied    = false;
+                                                    slot.splice_pending.push_back(sp);
+                                                    for (size_t i = 0; i < best_n; i++) {
+                                                        input_covered[head_p_x + i] = true;
                                                     }
+                                                    SLT_INF(slot, "cross-slot splice from slot %d: size %zu, donor KV [%zu, %zu) -> recipient [%zu, %zu) (parked in TEMP_SEQ)\n",
+                                                            other.id, best_n, best_hc, best_hc + best_n, head_p_x, head_p_x + best_n);
+                                                    head_p_x += best_n;
                                                 } else {
-                                                    head_p_x++;
+                                                    SLT_WRN(slot, "seq_cp_deep returned %u (wanted %zu) — skipping cross-slot splice from slot %d at hc=%zu (likely cell pool exhausted)\n",
+                                                            n_cells, best_n, other.id, best_hc);
+                                                    // Pool exhausted: no later splice can land
+                                                    // either, abort the whole cross-slot scan.
+                                                    stop_cross_scan = true;
                                                 }
+                                            } else {
+                                                head_p_x++;
                                             }
                                         }
 
