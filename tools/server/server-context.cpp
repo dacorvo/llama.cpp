@@ -2433,6 +2433,71 @@ private:
                                     n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
                                 }
 
+                                // ============================================================
+                                // Cross-slot CP extension (rung 3 step 2)
+                                //
+                                // The own-slot CP above already gives ``n_past`` against this
+                                // slot's prior content. But another idle slot may share a
+                                // longer prefix with the incoming request — typically because
+                                // the same conversation drifted to a different slot, or two
+                                // sessions share a system prompt + tools header longer than
+                                // anything in *this* slot. When that happens, we can copy the
+                                // matching prefix cells from the donor slot into this slot's
+                                // seq id, advance ``n_past`` to the donor's LCP, and skip
+                                // that much prefill.
+                                //
+                                // Gated on ``sim_at_select < CROSS_SLOT_SIM_THRESHOLD`` so
+                                // the continuation case (own slot already matches almost
+                                // everything) doesn't pay for the cross-slot scan. Gated on
+                                // ``!has_mtmd`` to stay clear of media-chunk position rules.
+                                // The scan is O(N_slots × LCP_compute) — cheap enough at the
+                                // single-digit slot counts the server runs today; rung 3
+                                // step 4 will swap in a hash index when N grows.
+                                constexpr float CROSS_SLOT_SIM_THRESHOLD = 0.9f;
+                                if (!slot.prompt.tokens.has_mtmd &&
+                                    (slot.sim_at_select < 0.0f || slot.sim_at_select < CROSS_SLOT_SIM_THRESHOLD) &&
+                                    n_past < input_tokens.size()) {
+                                    int32_t      best_other_lcp = (int32_t) n_past;
+                                    server_slot * donor = nullptr;
+                                    for (server_slot & other : slots) {
+                                        if (&other == &slot) continue;
+                                        if (other.is_processing()) continue;
+                                        if (other.prompt.tokens.empty()) continue;
+                                        if (other.prompt.tokens.has_mtmd) continue;
+                                        const size_t other_lcp = other.prompt.tokens.get_common_prefix(input_tokens);
+                                        if ((int32_t) other_lcp > best_other_lcp) {
+                                            best_other_lcp = (int32_t) other_lcp;
+                                            donor = &other;
+                                        }
+                                    }
+                                    if (donor != nullptr) {
+                                        const size_t old_n_past = n_past;
+                                        // Replace this slot's stale cells at the extension
+                                        // range with the donor's matching cells. The donor's
+                                        // cells stay alive (seq_cp is additive — donor keeps
+                                        // its seq id) so the same donor remains available to
+                                        // the next request.
+                                        llama_memory_seq_rm(llama_get_memory(ctx), slot.id,
+                                                             (llama_pos) old_n_past, (llama_pos) best_other_lcp);
+                                        llama_memory_seq_cp(llama_get_memory(ctx), donor->id, slot.id,
+                                                             (llama_pos) old_n_past, (llama_pos) best_other_lcp);
+                                        // Mirror in slot.prompt.tokens so the token vector stays
+                                        // consistent with the now-extended cached prefix. Use
+                                        // set_token within the existing vector size, push_back
+                                        // past it.
+                                        for (size_t i = old_n_past; i < (size_t) best_other_lcp; i++) {
+                                            if (i < slot.prompt.tokens.size()) {
+                                                slot.prompt.tokens.set_token((llama_pos) i, input_tokens[i]);
+                                            } else {
+                                                slot.prompt.tokens.push_back(input_tokens[i]);
+                                            }
+                                        }
+                                        SLT_INF(slot, "cross-slot CP extension from slot %d: n_past %zu -> %d (+%d)\n",
+                                                donor->id, old_n_past, best_other_lcp, best_other_lcp - (int32_t) old_n_past);
+                                        n_past = (size_t) best_other_lcp;
+                                    }
+                                }
+
                                 // if there is an alora invoked, don't cache after the invocation start
                                 if (slot.alora_invocation_start > 0) {
                                     SLT_DBG(slot, "only caching to alora invocation start (n_past = %d, alora_invocation_start = %d)\n", n_past, slot.alora_invocation_start);
