@@ -88,6 +88,14 @@ struct server_splice {
     llama_pos head_p;   // destination position in the recipient
     llama_pos n_match;  // chunk size in tokens
     bool      applied;  // becomes true once the cells have been moved into the slot
+
+    // For cross-slot splices: ``donor_slot_id`` is the source slot's seq
+    // id (or -1 for intra-slot, the legacy path). When ``pre_applied`` is
+    // true, the K/V data has already been deep-copied at scan time via
+    // ``llama_memory_seq_cp_deep`` and the cursor handler only needs to
+    // push tokens onto ``slot.prompt.tokens`` and mark ``applied``.
+    int       donor_slot_id = -1;
+    bool      pre_applied   = false;
 };
 
 // Position offset used to "park" splice source cells in the temp seq at
@@ -2674,6 +2682,102 @@ private:
                                         }
                                     }
 
+                                    // Cross-slot symmetric scan. For each other slot S, find
+                                    // chunks in S.prompt.tokens that match input positions not
+                                    // already covered by CP or by own-slot splices, and
+                                    // materialise S's matching cells into fresh cells tagged
+                                    // with slot.id at the recipient positions via
+                                    // ``llama_memory_seq_cp_deep``. The donor's cells stay
+                                    // intact — its CP is preserved (this is the property the
+                                    // intra-slot trampoline cannot give). Requires unified KV
+                                    // (the deep-copy primitive is only wired for that case).
+                                    if (can_use_temp_seq && !input_tokens.empty()) {
+                                        std::vector<bool> input_covered(input_tokens.size(), false);
+                                        for (size_t p = 0; p < (size_t) n_past && p < input_tokens.size(); p++) {
+                                            input_covered[p] = true;
+                                        }
+                                        for (const auto & s : splices) {
+                                            for (size_t i = 0; i < s.n_match; i++) {
+                                                if (s.head_p + i < input_tokens.size()) {
+                                                    input_covered[s.head_p + i] = true;
+                                                }
+                                            }
+                                        }
+
+                                        for (server_slot & other : slots) {
+                                            if (&other == &slot)              continue;
+                                            if (other.is_processing())        continue;
+                                            if (other.prompt.tokens.empty())  continue;
+                                            if (other.prompt.tokens.has_mtmd) continue;
+
+                                            const llama_pos donor_pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx), other.id);
+                                            const size_t    donor_size    = other.prompt.tokens.size();
+                                            const size_t    donor_hc_min  = donor_pos_min > 0 ? (size_t) donor_pos_min : 0;
+
+                                            size_t head_p_x = (size_t) n_past;
+                                            while (head_p_x + (size_t) n_cache_reuse <= input_tokens.size()) {
+                                                if (input_covered[head_p_x]) { head_p_x++; continue; }
+
+                                                size_t best_n  = 0;
+                                                size_t best_hc = 0;
+                                                for (size_t hc = donor_hc_min; hc < donor_size; hc++) {
+                                                    if (other.prompt.tokens[hc] != input_tokens[head_p_x]) continue;
+                                                    size_t n = 0;
+                                                    while (hc       + n < donor_size               &&
+                                                           head_p_x + n < input_tokens.size()      &&
+                                                           !input_covered[head_p_x + n]            &&
+                                                           other.prompt.tokens[hc + n] == input_tokens[head_p_x + n]) {
+                                                        n++;
+                                                    }
+                                                    if (n >= (size_t) n_cache_reuse) { best_n = n; best_hc = hc; break; }
+                                                }
+
+                                                if (best_n >= (size_t) n_cache_reuse) {
+                                                    // Park the donor's matching cells in the trampoline seq
+                                                    // (TEMP_SEQ=255) at packed positions, exactly like the
+                                                    // intra-slot symmetric path does — except we use
+                                                    // seq_cp_deep so the donor's cells stay intact at their
+                                                    // original positions (its CP is preserved). The cursor
+                                                    // handler below applies the splice (seq_add + seq_cp +
+                                                    // seq_rm) at head_p just like for intra-slot splices.
+                                                    constexpr llama_seq_id splice_temp = 255;
+                                                    const llama_pos pack_offset = (llama_pos) server_slot_splice_pack_base;
+                                                    const uint32_t n_cells = llama_memory_seq_cp_deep(
+                                                        llama_get_memory(ctx), other.id, splice_temp,
+                                                        (llama_pos) best_hc, (llama_pos) (best_hc + best_n),
+                                                        pack_offset);
+                                                    if (n_cells > 0 && (size_t) n_cells == best_n) {
+                                                        server_splice sp{};
+                                                        sp.head_c         = (llama_pos) best_hc;
+                                                        sp.head_p         = (llama_pos) head_p_x;
+                                                        sp.n_match        = (llama_pos) best_n;
+                                                        sp.applied        = false;
+                                                        sp.donor_slot_id  = other.id;
+                                                        sp.pre_applied    = false;  // use the standard trampoline cursor path
+                                                        slot.splice_pending.push_back(sp);
+                                                        for (size_t i = 0; i < best_n; i++) {
+                                                            input_covered[head_p_x + i] = true;
+                                                        }
+                                                        SLT_INF(slot, "cross-slot splice from slot %d: size %zu, donor KV [%zu, %zu) -> recipient [%zu, %zu) (parked in TEMP_SEQ)\n",
+                                                                other.id, best_n, best_hc, best_hc + best_n, head_p_x, head_p_x + best_n);
+                                                        head_p_x += best_n;
+                                                    } else {
+                                                        SLT_WRN(slot, "seq_cp_deep returned %u (wanted %zu) — skipping cross-slot splice from slot %d at hc=%zu\n",
+                                                                n_cells, best_n, other.id, best_hc);
+                                                        head_p_x++;
+                                                    }
+                                                } else {
+                                                    head_p_x++;
+                                                }
+                                            }
+                                        }
+
+                                        std::sort(slot.splice_pending.begin(), slot.splice_pending.end(),
+                                                  [](const server_splice & a, const server_splice & b) {
+                                                      return a.head_p < b.head_p;
+                                                  });
+                                    }
+
                                     SLT_DBG(slot, "after context reuse, n_past = %d, splice_pending = %zu\n",
                                             n_past, slot.splice_pending.size());
                                 }
@@ -2947,21 +3051,29 @@ private:
                                 s.applied = true;
                                 break;
                             }
-                            constexpr llama_seq_id splice_temp = 255;
-                            const llama_pos packed_lo = server_slot_splice_pack_base + s.head_c;
-                            const llama_pos packed_hi = packed_lo + n_to_apply;
-                            const llama_pos to_dest   = s.head_p - packed_lo;
-                            llama_memory_seq_add(llama_get_memory(ctx), splice_temp,
-                                                 packed_lo, packed_hi, to_dest);
-                            llama_memory_seq_cp (llama_get_memory(ctx), splice_temp, slot.id,
-                                                 s.head_p, s.head_p + n_to_apply);
-                            // Drop the temp tag so a later splice's seq_add on a
-                            // different packed range doesn't drag these cells.
-                            llama_memory_seq_rm (llama_get_memory(ctx), splice_temp,
-                                                 s.head_p, s.head_p + n_to_apply);
+                            if (s.pre_applied) {
+                                // Cross-slot deep-copy splice: cells are already in place at
+                                // [head_p, head_p+n) tagged with slot.id (placed at scan time
+                                // via llama_memory_seq_cp_deep). No tensor ops needed here.
+                                SLT_INF(slot, "applying pre-placed cross-slot splice from donor slot %d, size %d, KV [%d, %d) -> [%d, %d)\n",
+                                        s.donor_slot_id, n_to_apply, s.head_c, s.head_c + n_to_apply, s.head_p, s.head_p + n_to_apply);
+                            } else {
+                                constexpr llama_seq_id splice_temp = 255;
+                                const llama_pos packed_lo = server_slot_splice_pack_base + s.head_c;
+                                const llama_pos packed_hi = packed_lo + n_to_apply;
+                                const llama_pos to_dest   = s.head_p - packed_lo;
+                                llama_memory_seq_add(llama_get_memory(ctx), splice_temp,
+                                                     packed_lo, packed_hi, to_dest);
+                                llama_memory_seq_cp (llama_get_memory(ctx), splice_temp, slot.id,
+                                                     s.head_p, s.head_p + n_to_apply);
+                                // Drop the temp tag so a later splice's seq_add on a
+                                // different packed range doesn't drag these cells.
+                                llama_memory_seq_rm (llama_get_memory(ctx), splice_temp,
+                                                     s.head_p, s.head_p + n_to_apply);
+                                SLT_INF(slot, "reusing chunk with size %d, shifting KV cache [%d, %d) -> [%d, %d)\n",
+                                        n_to_apply, s.head_c, s.head_c + n_to_apply, s.head_p, s.head_p + n_to_apply);
+                            }
                             s.applied = true;
-                            SLT_INF(slot, "reusing chunk with size %d, shifting KV cache [%d, %d) -> [%d, %d)\n",
-                                    n_to_apply, s.head_c, s.head_c + n_to_apply, s.head_p, s.head_p + n_to_apply);
                             // Push the spliced tokens into slot.prompt.tokens so
                             // the cursor advances past them and the next loop
                             // iteration picks the right cur_tok. These tokens

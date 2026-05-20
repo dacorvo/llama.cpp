@@ -717,6 +717,21 @@ extern "C" {
                  llama_pos p0,
                  llama_pos p1);
 
+    // Non-destructive deep copy: every cell tagged with ``seq_id_src`` in
+    // [p0, p1) is duplicated into a fresh cell tagged ``seq_id_dst`` at
+    // position ``src_pos + dst_pos_offset``. Source cells are left intact.
+    // K cells are RoPE-rephased to their new positions on the next graph
+    // update. Returns the number of cells duplicated, 0 if none or if
+    // the cache is too full to allocate the destination cells. Currently
+    // implemented for the attention KV cache only.
+    LLAMA_API uint32_t llama_memory_seq_cp_deep(
+            llama_memory_t mem,
+              llama_seq_id seq_id_src,
+              llama_seq_id seq_id_dst,
+                 llama_pos p0,
+                 llama_pos p1,
+                 llama_pos dst_pos_offset);
+
     // Removes all tokens that do not belong to the specified sequence
     LLAMA_API void llama_memory_seq_keep(
             llama_memory_t mem,

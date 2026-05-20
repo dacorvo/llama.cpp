@@ -86,17 +86,23 @@ shared prefix.
 
 **Effort:** ~80 lines, one day.
 
-### Step 3 — Cross-slot symmetric scan (BLOCKED on deep-copy primitive)
+### Step 3 — Cross-slot symmetric scan (IN PROGRESS — deep-copy primitive)
 
-**Status:** prototyped, reverted. Blocked on a missing memory-module
-primitive.
+**Status:** depends on a new `seq_cp_deep` memory-module primitive.
+Scaffolding (header + metadata-only stub) is WIP on the asymmetric
+branch; the K/V graph-side data move is the remaining work. The
+destructive intra-slot path stays as-is — cross-slot is a separate
+code path on top of the deep-copy primitive.
+
+#### Background — why the obvious path doesn't work
 
 The intent was: after own-slot symmetric scan, also scan **other
 slots'** `prompt.tokens` for chunks matching the input past CP, and
 for each match `seq_cp` the donor's cells into the splice temp
-trampoline as today's intra-slot path does.
+trampoline as today's intra-slot path does. A prototype was built
+and reverted.
 
-What stops it from being safely shippable:
+What stopped the naive approach from being safely shippable:
 
 Under `--kv-unified`, all seq ids share a single underlying cell
 pool. Same-stream `seq_cp(src, dst, p0, p1)` is **tag-additive**,
@@ -122,32 +128,59 @@ CP is the most valuable cache primitive for TTFT. Breaking it on
 the donor every time a sibling slot does a cross-slot splice is
 unshippable.
 
-**Unblockers:**
+#### Path forward — `seq_cp_deep`
 
-1. Add a `seq_cp_deep(src, dst, p0, p1, dst_offset)` primitive to
-   `llama-kv-cache.cpp` for the unified case. This would allocate
-   fresh cells, copy K and V tensors from the source, RoPE-rephase
-   K to the destination positions, and tag the new cells with the
-   destination seq id. The source cells stay untouched and the
-   donor's CP keeps working. ~300-500 lines in the memory module
-   plus the splice-path integration.
+Add a `seq_cp_deep(src, dst, p0, p1, dst_offset)` primitive to
+`llama-kv-cache.cpp` for the unified case. It allocates fresh
+cells, copies K and V tensors from source to destination cells,
+RoPE-rephases K to the destination positions via the existing
+`cell.shift` mechanism, and tags the new cells with the
+destination seq id. **The source cells stay untouched**, so the
+donor's CP keeps working. This is the same primitive rung 4
+(persistent disk-backed pool) will need to hydrate cells back
+into GPU KV at boot, so the investment compounds.
 
-2. Or run with non-unified KV so each slot is its own stream and
-   the cross-stream `seq_cp` (llama-kv-cache.cpp:462+) deep-copies
-   on its own. But the splice-temp trampoline relies on seq id 255
-   being addressable, which only works in unified mode — we'd have
-   to rework that, plus pay extra memory for per-stream cell pools.
+The alternative — running with non-unified KV so each slot is its
+own stream and cross-stream `seq_cp` (llama-kv-cache.cpp:462+)
+deep-copies on its own — was rejected: the splice-temp trampoline
+relies on seq id 255 being addressable, which only works in
+unified mode. Reworking that plus paying extra memory for
+per-stream cell pools is a worse trade.
 
-Option 1 is the right foundation: it's the same primitive rung 4
-(persistent disk-backed pool) will need to hydrate cells back into
-GPU KV at boot. Step 3 reopens once that lands.
+#### Sub-steps
 
-**What ships from this step in the meantime:** nothing. The
-revert keeps cross-slot CP (step 2, non-destructive) as the only
-cross-slot mechanism. Step 4 (hash index) can still proceed — its
-benefit applies to the own-slot symmetric scan that already
-exists, plus to step-2-style cross-slot CP, plus to whatever
-unblocked step 3 looks like.
+- **3a — metadata scaffolding** (WIP, uncommitted): adds
+  `cell_copy_info { src_idxs, dst_idxs }` to `llama-kv-cache.h`,
+  declares `seq_cp_deep` on both `llama_memory_i` (with abort
+  default) and `llama_kv_cache`, implements the cell allocation +
+  `pos_set` / `ext_set` / `seq_add` / `pos_add(shift)` metadata
+  path, and enqueues (src_idx, dst_idx) pairs into `cc_info`.
+  Compiles. Not callable for real use yet — data not moved.
+
+- **3b — graph-side data move**: build a one-shot graph using
+  `ggml_get_rows` + `ggml_set_rows` per layer for K and for V
+  (V layout depends on `v_trans`). Run it in `update()` before
+  the K-shift pass so the freshly-copied K cells get rephased
+  by the existing shift mechanism. Wire `cc_info` into graph
+  build the same way `defrag_info` already is. Add ISWA wrapper
+  delegating to the underlying caches. Expose
+  `llama_memory_seq_cp_deep` as a public API on
+  `llama_memory_i`.
+
+- **3c — cross-slot splice integration**: separate code path
+  from today's intra-slot destructive splice. For cross-slot
+  donors, use `seq_cp_deep(donor.id, this.id, hc, hc+n,
+  base - hc)` directly — no splice-temp trampoline, no
+  `seq_rm` on donor. Gate same way as step 2:
+  `sim_at_select < CROSS_SLOT_SIM_THRESHOLD`.
+
+**Validation:** rung-2.5 multi-slot replay — confirm cross-slot
+splice events fire, donor's subsequent same-session continuation
+still hits its own CP at full length (no hole).
+
+**Effort:** 3a done (~150 lines). 3b is the bulk (~300-500 lines
+in the memory module). 3c is small (~50 lines) once 3b lands.
+Total ~1 week wall, gated behind a flag until validated.
 
 ### Step 4 — Rolling-hash index for the slot pool
 
@@ -213,15 +246,17 @@ before the recipient arrives.
 
 ## Total
 
-| step | scope                              | lines | wall  |
-|------|------------------------------------|-------|-------|
-| 1    | plumb scheduler LCP                | ~30   | 0.5d  |
-| 2    | cross-slot CP                      | ~80   | 1.0d  |
-| 3    | cross-slot symmetric scan          | ~150  | 2.0d  |
-| 4    | rolling-hash index                 | ~250  | 2-3d  |
-| 5    | validation harness                 | small | 1.0d  |
-| 6    | flags + docs                       | small | 0.5d  |
-|      | **total**                          |       | ~1.5w |
+| step | scope                              | lines   | wall   | status      |
+|------|------------------------------------|---------|--------|-------------|
+| 1    | plumb scheduler LCP                | ~30     | 0.5d   | done        |
+| 2    | cross-slot CP                      | ~80     | 1.0d   | done        |
+| 3a   | seq_cp_deep metadata scaffolding   | ~150    | 0.5d   | WIP         |
+| 3b   | seq_cp_deep K/V graph data move    | ~300-500| ~1w    | not started |
+| 3c   | cross-slot splice integration      | ~50     | 0.5d   | not started |
+| 4    | rolling-hash index                 | ~250    | 2-3d   | not started |
+| 5    | validation harness                 | small   | 1.0d   | not started |
+| 6    | flags + docs                       | small   | 0.5d   | not started |
+|      | **total**                          |         | ~2-3w  |             |
 
 ## Out of scope (rung 4)
 

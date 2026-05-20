@@ -3502,6 +3502,20 @@ void llama_memory_seq_cp(
     mem->seq_cp(seq_id_src, seq_id_dst, p0, p1);
 }
 
+uint32_t llama_memory_seq_cp_deep(
+        llama_memory_t mem,
+          llama_seq_id seq_id_src,
+          llama_seq_id seq_id_dst,
+             llama_pos p0,
+             llama_pos p1,
+             llama_pos dst_pos_offset) {
+    if (!mem) {
+        return 0;
+    }
+
+    return mem->seq_cp_deep(seq_id_src, seq_id_dst, p0, p1, dst_pos_offset);
+}
+
 void llama_memory_seq_keep(
         llama_memory_t mem,
           llama_seq_id seq_id) {

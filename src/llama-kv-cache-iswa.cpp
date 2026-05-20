@@ -91,6 +91,21 @@ void llama_kv_cache_iswa::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_ds
     kv_swa ->seq_cp(seq_id_src, seq_id_dst, p0, p1);
 }
 
+uint32_t llama_kv_cache_iswa::seq_cp_deep(
+        llama_seq_id seq_id_src,
+        llama_seq_id seq_id_dst,
+        llama_pos    p0,
+        llama_pos    p1,
+        llama_pos    dst_pos_offset) {
+    // Both caches must perform the deep copy. They can return different
+    // counts (the SWA cache may have evicted older cells in [p0, p1)
+    // that the base cache still holds). Caller treats the SWA count as
+    // authoritative for the recipient seq's future attention window.
+    const uint32_t n_base = kv_base->seq_cp_deep(seq_id_src, seq_id_dst, p0, p1, dst_pos_offset);
+    const uint32_t n_swa  = kv_swa ->seq_cp_deep(seq_id_src, seq_id_dst, p0, p1, dst_pos_offset);
+    return std::min(n_base, n_swa);
+}
+
 void llama_kv_cache_iswa::seq_keep(llama_seq_id seq_id) {
     kv_base->seq_keep(seq_id);
     kv_swa ->seq_keep(seq_id);

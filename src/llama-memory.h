@@ -106,6 +106,24 @@ struct llama_memory_i {
     virtual void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) = 0;
     virtual void seq_div (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, int d) = 0;
 
+    // Non-destructive deep copy of cells matching ``seq_id_src`` in the
+    // position range [p0, p1). Allocates fresh cells, copies K/V tensor
+    // data, sets the new cells' positions to ``src_pos + dst_pos_offset``,
+    // tags them with ``seq_id_dst``, and triggers RoPE rephase via the
+    // shift field. Source cells stay intact. Returns number of cells
+    // copied, 0 on failure or absence. Default abort — only the attention
+    // KV cache implements it today; recurrent and hybrid backends would
+    // need their own (recurrent state cells aren't trivially copyable).
+    virtual uint32_t seq_cp_deep(
+            llama_seq_id seq_id_src,
+            llama_seq_id seq_id_dst,
+            llama_pos    p0,
+            llama_pos    p1,
+            llama_pos    dst_pos_offset) {
+        (void) seq_id_src; (void) seq_id_dst; (void) p0; (void) p1; (void) dst_pos_offset;
+        GGML_ABORT("seq_cp_deep not supported by this memory backend");
+    }
+
     virtual llama_pos seq_pos_min(llama_seq_id seq_id) const = 0;
     virtual llama_pos seq_pos_max(llama_seq_id seq_id) const = 0;
 

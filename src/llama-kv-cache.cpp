@@ -490,6 +490,110 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
     //}
 }
 
+uint32_t llama_kv_cache::seq_cp_deep(
+        llama_seq_id seq_id_src,
+        llama_seq_id seq_id_dst,
+        llama_pos    p0,
+        llama_pos    p1,
+        llama_pos    dst_pos_offset) {
+    GGML_ASSERT(seq_id_src >= 0 && (size_t) seq_id_src < seq_to_stream.size());
+    GGML_ASSERT(seq_id_dst >= 0 && (size_t) seq_id_dst < seq_to_stream.size());
+
+    const auto s_src = seq_to_stream[seq_id_src];
+    const auto s_dst = seq_to_stream[seq_id_dst];
+
+    // seq_cp_deep is intended for the unified-cache case where both seqs
+    // share one stream of cells. Cross-stream deep copy would require a
+    // different mechanism (use ``seq_cp`` cross-stream which already deep
+    // copies whole streams via ``sc_info``).
+    if (s_src != s_dst) {
+        GGML_ABORT("seq_cp_deep across distinct streams is not supported");
+    }
+
+    auto & cells = v_cells[s_src];
+    auto & head  = v_heads[s_src];
+
+    if (p0 < 0) p0 = 0;
+    if (p1 < 0) p1 = std::numeric_limits<llama_pos>::max();
+    if (p0 >= p1) return 0;
+
+    // First pass: gather source cell indices that match (seq_id_src tag,
+    // position in [p0, p1)). We collect them up front so we can iterate
+    // deterministically while allocating empty cells, even if the
+    // allocator picks indices from the same pool.
+    std::vector<uint32_t> src_idxs_local;
+    src_idxs_local.reserve(p1 - p0 < 1024 ? (size_t) (p1 - p0) : 1024);
+    for (uint32_t i = 0; i < cells.size(); ++i) {
+        if (cells.is_empty(i)) continue;
+        if (!cells.pos_in(i, p0, p1)) continue;
+        if (!cells.seq_has(i, seq_id_src)) continue;
+        src_idxs_local.push_back(i);
+    }
+
+    if (src_idxs_local.empty()) {
+        return 0;
+    }
+
+    // Second pass: allocate ``src_idxs_local.size()`` empty cells. We
+    // scan the pool starting at the cache's head pointer (same starting
+    // point ``find_slot`` would use, which keeps allocations clustered).
+    // We do not allocate over an empty source cell — but a source cell
+    // is by definition non-empty here, so the two sets are disjoint.
+    std::vector<uint32_t> dst_idxs_local;
+    dst_idxs_local.reserve(src_idxs_local.size());
+    {
+        const uint32_t total = cells.size();
+        const uint32_t start = head;
+        for (uint32_t off = 0; off < total && dst_idxs_local.size() < src_idxs_local.size(); ++off) {
+            const uint32_t i = (start + off) % total;
+            if (cells.is_empty(i)) {
+                dst_idxs_local.push_back(i);
+            }
+        }
+    }
+
+    if (dst_idxs_local.size() < src_idxs_local.size()) {
+        // Not enough empty cells. Caller must shed cache before retrying.
+        return 0;
+    }
+
+    // Third pass: set destination cell metadata. The data move is deferred
+    // to the next ``update`` call, which will walk ``cc_info`` and run the
+    // copy graph followed by the K-shift graph (the shift field we set
+    // here triggers RoPE rephase for the new positions).
+    for (size_t k = 0; k < src_idxs_local.size(); ++k) {
+        const uint32_t src_i = src_idxs_local[k];
+        const uint32_t dst_i = dst_idxs_local[k];
+
+        const llama_pos src_pos = cells.pos_get(src_i);
+        // Copy ext (multimodal axes) verbatim so IM-RoPE / M-RoPE cells
+        // shift on the same per-axis path the existing K-shift handles.
+        const llama_kv_cell_ext ext = cells.ext_get(src_i);
+
+        cells.pos_set(dst_i, src_pos);         // dst empty -> assigns pos, marks used
+        cells.ext_set(dst_i, ext);             // copy multimodal positional axes
+        cells.seq_add(dst_i, seq_id_dst);      // tags dst, updates seq_pos[dst]
+        if (dst_pos_offset != 0) {
+            cells.pos_add(dst_i, dst_pos_offset, /*shift_ext=*/false); // shifts pos+shift, sets has_shift
+        }
+
+        cc_info.src_idxs.push_back(src_i);
+        cc_info.dst_idxs.push_back(dst_i);
+        cc_info.streams.push_back(s_src);
+    }
+
+    // Advance the head past the highest dst we allocated, so the next
+    // find_slot starts looking past our just-allocated range. Keeps
+    // allocation behaviour roughly consistent with apply_ubatch.
+    {
+        uint32_t max_dst = 0;
+        for (uint32_t i : dst_idxs_local) if (i > max_dst) max_dst = i;
+        head = (max_dst + 1) % cells.size();
+    }
+
+    return (uint32_t) src_idxs_local.size();
+}
+
 void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
 
@@ -686,7 +790,7 @@ llama_memory_context_ptr llama_kv_cache::init_update(llama_context * lctx, bool 
 
     bool do_shift = get_has_shift();
 
-    return std::make_unique<llama_kv_cache_context>(this, lctx, do_shift, std::move(sc_info));
+    return std::make_unique<llama_kv_cache_context>(this, lctx, do_shift, std::move(sc_info), std::move(cc_info));
 }
 
 llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_ubatch> & ubatches) {
@@ -755,10 +859,35 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
     return res;
 }
 
-bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_copy_info & sc_info) {
+bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_copy_info & sc_info, const cell_copy_info & cc_info) {
     bool updated = false;
 
     auto * sched = lctx->get_sched();
+
+    if (!cc_info.empty()) {
+        LLAMA_LOG_DEBUG("%s: applying %zu cell copies\n", __func__, cc_info.src_idxs.size());
+
+        ggml_backend_sched_reset(sched);
+
+        auto * res = lctx->get_gf_res_reserve();
+
+        res->reset();
+
+        auto * gf = build_graph_cell_copy(res, lctx, cc_info);
+        if (!ggml_backend_sched_alloc_graph(sched, gf)) {
+            LLAMA_LOG_ERROR("%s: failed to allocate compute graph for cell copy\n", __func__);
+            return updated;
+        }
+
+        res->set_inputs(nullptr);
+
+        if (lctx->graph_compute(gf, false) != GGML_STATUS_SUCCESS) {
+            LLAMA_LOG_ERROR("%s: failed to compute cell copy\n", __func__);
+            return updated;
+        }
+
+        updated = true;
+    }
 
     if (!sc_info.empty()) {
         assert(n_stream > 1 && "stream copy should never happen with a single stream");
@@ -1872,6 +2001,116 @@ void llm_graph_input_k_shift::set_input(const llama_ubatch * ubatch) {
     }
 }
 
+class llm_graph_input_cell_copy : public llm_graph_input_i {
+public:
+    llm_graph_input_cell_copy(const llama_kv_cache * kv_self, const llama_kv_cache::cell_copy_info * cc_info)
+        : kv_self(kv_self), cc_info(cc_info) {}
+    virtual ~llm_graph_input_cell_copy() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    ggml_tensor * src_idxs = nullptr; // I32 [n_pairs]
+    ggml_tensor * dst_idxs = nullptr; // I64 [n_pairs]
+
+    const llama_kv_cache *                 kv_self;
+    const llama_kv_cache::cell_copy_info * cc_info;
+};
+
+void llm_graph_input_cell_copy::set_input(const llama_ubatch * ubatch) {
+    GGML_UNUSED(ubatch);
+
+    if (src_idxs) {
+        kv_self->set_input_cc_src_idxs(src_idxs, *cc_info);
+    }
+    if (dst_idxs) {
+        kv_self->set_input_cc_dst_idxs(dst_idxs, *cc_info);
+    }
+}
+
+void llama_kv_cache::set_input_cc_src_idxs(ggml_tensor * dst, const cell_copy_info & cc_info) const {
+    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+    GGML_ASSERT(dst->type == GGML_TYPE_I32);
+
+    int32_t * data = (int32_t *) dst->data;
+
+    const uint32_t kv_size = get_size();
+
+    for (size_t k = 0; k < cc_info.src_idxs.size(); ++k) {
+        data[k] = (int32_t) (cc_info.streams[k]*kv_size + cc_info.src_idxs[k]);
+    }
+}
+
+void llama_kv_cache::set_input_cc_dst_idxs(ggml_tensor * dst, const cell_copy_info & cc_info) const {
+    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+    GGML_ASSERT(dst->type == GGML_TYPE_I64);
+
+    int64_t * data = (int64_t *) dst->data;
+
+    const uint32_t kv_size = get_size();
+
+    for (size_t k = 0; k < cc_info.dst_idxs.size(); ++k) {
+        data[k] = (int64_t) cc_info.streams[k]*kv_size + (int64_t) cc_info.dst_idxs[k];
+    }
+}
+
+ggml_cgraph * llama_kv_cache::build_graph_cell_copy(llm_graph_result * res, llama_context * lctx, const cell_copy_info & cc_info) const {
+    GGML_UNUSED(lctx);
+
+    auto * ctx = res->get_ctx();
+    auto * gf  = res->get_gf();
+
+    const int64_t n_pairs = (int64_t) cc_info.src_idxs.size();
+    GGML_ASSERT(n_pairs > 0);
+    GGML_ASSERT((int64_t) cc_info.dst_idxs.size() == n_pairs);
+
+    auto inp = std::make_unique<llm_graph_input_cell_copy>(this, &cc_info);
+
+    inp->src_idxs = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_pairs);
+    inp->dst_idxs = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_pairs);
+    ggml_set_input(inp->src_idxs);
+    ggml_set_input(inp->dst_idxs);
+
+    const int64_t kv_size = get_size();
+
+    for (const auto & layer : layers) {
+        const uint32_t il = layer.il;
+
+        // K is stored as [n_embd_k_gqa, kv_size, n_stream] regardless of
+        // v_trans (the transpose only affects V's logical view). Same for
+        // V's underlying storage when v_trans=true: it is allocated with
+        // n_embd_v_gqa_max as the innermost dim. The actual attention-time
+        // view transposes it, but the bytes are laid out the same as K.
+        const int64_t n_embd_k_gqa = hparams.n_embd_k_gqa(il);
+        const int64_t n_embd_v_gqa = v_trans ? hparams.n_embd_v_gqa_max()
+                                              : hparams.n_embd_v_gqa(il);
+
+        // Flatten the [n_embd, kv_size, n_stream] cache into a 2D view
+        // so the I32/I64 idx tensors address rows directly by global flat
+        // cell index (= stream*kv_size + cell). This is uniform for
+        // n_stream == 1 (where the global == local) and n_stream > 1.
+
+        // K copy
+        if (layer.k) {
+            ggml_tensor * k = ggml_reshape_2d(ctx, layer.k, n_embd_k_gqa, kv_size*n_stream);
+            ggml_tensor * gathered = ggml_get_rows(ctx, k, inp->src_idxs);
+            ggml_tensor * stored   = ggml_set_rows(ctx, k, gathered, inp->dst_idxs);
+            ggml_build_forward_expand(gf, stored);
+        }
+
+        // V copy (MLA models have layer.v == nullptr — skip)
+        if (layer.v) {
+            ggml_tensor * v = ggml_reshape_2d(ctx, layer.v, n_embd_v_gqa, kv_size*n_stream);
+            ggml_tensor * gathered = ggml_get_rows(ctx, v, inp->src_idxs);
+            ggml_tensor * stored   = ggml_set_rows(ctx, v, gathered, inp->dst_idxs);
+            ggml_build_forward_expand(gf, stored);
+        }
+    }
+
+    res->add_input(std::move(inp));
+
+    return gf;
+}
+
 ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_context * lctx) const {
     auto * ctx = res->get_ctx();
     auto * gf  = res->get_gf();
@@ -2455,8 +2694,9 @@ llama_kv_cache_context::llama_kv_cache_context(
         llama_kv_cache * kv,
         llama_context * lctx,
         bool do_shift,
-        stream_copy_info sc_info) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv), lctx(lctx), do_shift(do_shift), sc_info(std::move(sc_info)) {
-    if (!do_shift && this->sc_info.empty()) {
+        stream_copy_info sc_info,
+        cell_copy_info   cc_info) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv), lctx(lctx), do_shift(do_shift), sc_info(std::move(sc_info)), cc_info(std::move(cc_info)) {
+    if (!do_shift && this->sc_info.empty() && this->cc_info.empty()) {
         status = LLAMA_MEMORY_STATUS_NO_UPDATE;
     }
 }
@@ -2484,7 +2724,7 @@ bool llama_kv_cache_context::apply() {
 
     // no ubatches -> this is a KV cache update
     if (ubatches.empty()) {
-        kv->update(lctx, do_shift, sc_info);
+        kv->update(lctx, do_shift, sc_info, cc_info);
 
         return true;
     }

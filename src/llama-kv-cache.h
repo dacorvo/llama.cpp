@@ -29,6 +29,35 @@ public:
         std::vector<uint32_t> sdst;
     };
 
+    // Pending per-cell deep copies queued by ``seq_cp_deep``. Each entry is
+    // a (source cell index, destination cell index) pair within the same
+    // stream of the unified KV pool. The destination cells must already
+    // have their metadata (pos / seq tag / shift) set; this struct only
+    // records the underlying K/V tensor data move, which is realised by
+    // ``build_graph_cell_copy`` on the next ``update`` pass. The
+    // ``streams`` vector lines up with ``src_idxs`` / ``dst_idxs`` and
+    // gives each pair's stream id; in unified mode it is always 0.
+    // Distinct from ``stream_copy_info``, which copies whole streams —
+    // ``cell_copy_info`` copies arbitrary cell ranges within one stream
+    // (the basis for non-destructive cross-slot splice).
+    struct cell_copy_info {
+        bool empty() const {
+            assert(src_idxs.size() == dst_idxs.size());
+            assert(streams.size()  == dst_idxs.size());
+            return src_idxs.empty();
+        }
+
+        void clear() {
+            src_idxs.clear();
+            dst_idxs.clear();
+            streams.clear();
+        }
+
+        std::vector<uint32_t> src_idxs;
+        std::vector<uint32_t> dst_idxs;
+        std::vector<uint32_t> streams;
+    };
+
     // for each ubatch, create a slot_info that contains information about where the ubatch should be inserted in the
     //   KV cells. for example, cell indices for each token, such that: token[i] -> goes to cells[idxs[i]]
     struct slot_info {
@@ -177,7 +206,29 @@ public:
     // return empty vector on failure
     slot_info_vec_t prepare(const std::vector<llama_ubatch> & ubatches);
 
-    bool update(llama_context * lctx, bool do_shift, const stream_copy_info & sc_info);
+    bool update(llama_context * lctx, bool do_shift, const stream_copy_info & sc_info, const cell_copy_info & cc_info);
+
+    // Non-destructive deep copy of every cell tagged with ``seq_id_src`` in
+    // the position range [p0, p1). Allocates fresh cells in the unified
+    // pool, schedules the K/V data move into ``cc_info`` for the next
+    // ``update``, and sets the new cells' metadata: position = src_pos +
+    // dst_pos_offset, seq tag = ``seq_id_dst``, shift = dst_pos_offset.
+    // Source cells stay intact (still tagged with seq_id_src at their
+    // original positions). The shift field triggers a RoPE rephase via
+    // the existing K-shift mechanism on the same update pass, so the dst
+    // cells end up RoPE-phased for their new positions.
+    //
+    // Returns the number of cells copied, or 0 on failure (no source
+    // cells, no empty room, or backend constraint violated).
+    //
+    // Required for non-destructive cross-slot splice; see
+    // tools/server/notes/CROSS_SLOT_REUSE_PLAN.md.
+    uint32_t seq_cp_deep(
+            llama_seq_id seq_id_src,
+            llama_seq_id seq_id_dst,
+            llama_pos    p0,
+            llama_pos    p1,
+            llama_pos    dst_pos_offset);
 
     // find a slot of kv cells that can hold the ubatch
     // if cont == true, then the slot must be continuous
@@ -201,6 +252,13 @@ public:
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
 
     void set_input_k_shift(ggml_tensor * dst) const;
+
+    // Setters for the gather (I32) and scatter (I64) index tensors used
+    // by ``build_graph_cell_copy``. Indices are global flat indices into
+    // the unified K/V tensors of shape [n_embd_*, kv_size, n_stream] —
+    // i.e. ``cc_info.streams[k] * kv_size + cc_info.{src,dst}_idxs[k]``.
+    void set_input_cc_src_idxs(ggml_tensor * dst, const cell_copy_info & cc_info) const;
+    void set_input_cc_dst_idxs(ggml_tensor * dst, const cell_copy_info & cc_info) const;
 
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
@@ -268,6 +326,11 @@ private:
     // pending stream copies that will be applied during the next update
     stream_copy_info sc_info;
 
+    // pending per-cell deep copies queued by ``seq_cp_deep``. Realised by
+    // ``build_graph_cell_copy`` and ``set_input_cell_copy_idxs`` on the
+    // next ``update`` pass (alongside, and before, any K-shift).
+    cell_copy_info cc_info;
+
     std::vector<kv_layer> layers;
 
     // model layer id -> KV cache layer id
@@ -293,6 +356,16 @@ private:
                llm_graph_result * res,
                   llama_context * lctx) const;
 
+    // Build a graph that performs the per-cell K/V data move queued in
+    // ``cc_info``. K rows are copied as-is (still RoPE-phased at their
+    // source positions); the subsequent K-shift pass (driven by the
+    // dst cells' ``shift`` field, set up by ``seq_cp_deep``) rephases
+    // K to the destination positions on the same ``update`` call.
+    ggml_cgraph * build_graph_cell_copy(
+               llm_graph_result * res,
+                  llama_context * lctx,
+            const cell_copy_info & cc_info) const;
+
     struct cell_ranges_t {
         uint32_t strm;
 
@@ -311,6 +384,7 @@ public:
     // some shorthands
     using slot_info_vec_t  = llama_kv_cache::slot_info_vec_t;
     using stream_copy_info = llama_kv_cache::stream_copy_info;
+    using cell_copy_info   = llama_kv_cache::cell_copy_info;
 
     // used for errors
     llama_kv_cache_context(llama_memory_status status);
@@ -324,7 +398,8 @@ public:
             llama_kv_cache * kv,
             llama_context * lctx,
             bool do_shift,
-            stream_copy_info sc_info);
+            stream_copy_info sc_info,
+            cell_copy_info   cc_info);
 
     // used to create a batch processing context from a batch
     llama_kv_cache_context(
@@ -398,6 +473,7 @@ private:
     bool do_shift = false;
 
     stream_copy_info sc_info;
+    cell_copy_info   cc_info;
 
     //
     // batch processing context
