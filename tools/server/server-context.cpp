@@ -139,6 +139,19 @@ struct server_slot {
     // loop applies the splice (moves cells into the slot) and skips ahead.
     std::vector<server_splice> splice_pending;
 
+    // Snapshot of the LCP fit between this slot and the task that selected
+    // it, recorded at slot-selection time. ``lcp_at_select`` is the length
+    // of the longest common prefix between ``prompt.tokens`` and the
+    // incoming task's tokens; ``sim_at_select`` is ``lcp_at_select /
+    // task.tokens.size()`` — the fraction the scheduler used to rank this
+    // slot against the others. Reused by ``update_slots`` to skip the
+    // redundant ``get_common_prefix`` recomputation when CP fires, and (in
+    // upcoming steps) to decide whether to engage the cross-slot scan.
+    // Reset to ``-1`` / ``-1.0f`` when no LCP scoring happened for this
+    // request (e.g. LRU fallback, cache_prompt=false).
+    int32_t lcp_at_select = -1;
+    float   sim_at_select = -1.0f;
+
     size_t last_nl_pos = 0;
 
     std::string  generated_text;
@@ -226,6 +239,12 @@ struct server_slot {
 
         n_prompt_tokens_cache = 0;
         splice_pending.clear();
+
+        // Drop the scheduler's LCP snapshot so the next task starts fresh
+        // and update_slots falls back to get_common_prefix if no new score
+        // is recorded (e.g. LRU-selected, cache_prompt=false).
+        lcp_at_select = -1;
+        sim_at_select = -1.0f;
 
         last_nl_pos    = 0;
         generated_text = "";
@@ -1124,7 +1143,8 @@ private:
 
         // find the slot that has at least n% prompt similarity
         if (ret == nullptr && slot_prompt_similarity != 0.0f) {
-            float sim_best = 0;
+            float   sim_best = 0;
+            int32_t lcp_best = 0;
 
             for (server_slot & slot : slots) {
                 // skip the slot if it is not available
@@ -1139,12 +1159,14 @@ private:
                     continue;
                 }
 
-                // fraction of the Longest Common Prefix length with respect to the input prompt length
-                const float sim_cur = float(tokens.get_common_prefix(task.tokens)) / task.tokens.size();
+                // Longest Common Prefix length + fraction wrt the input prompt length
+                const int32_t lcp_cur = (int32_t) tokens.get_common_prefix(task.tokens);
+                const float   sim_cur = float(lcp_cur) / task.tokens.size();
 
                 // select the current slot if the criteria match
                 if (sim_cur > sim_best && sim_cur > slot_prompt_similarity) {
                     sim_best = sim_cur;
+                    lcp_best = lcp_cur;
 
                     ret = &slot;
                 }
@@ -1155,6 +1177,12 @@ private:
 
                 SLT_INF(*ret, "selected slot by LCP similarity, sim_best = %.3f (> %.3f thold), f_keep = %.3f\n",
                         sim_best, slot_prompt_similarity, f_keep);
+
+                // Record the scheduler's LCP scoring so update_slots can
+                // skip the get_common_prefix recomputation and (rung 3+)
+                // gate the cross-slot scan on sim_at_select.
+                ret->lcp_at_select = lcp_best;
+                ret->sim_at_select = sim_best;
 
                 // if we are about to lose a large portion of the existing context - save it in the prompt cache
                 if (f_keep < 0.5f) {
@@ -2390,8 +2418,20 @@ private:
                             }
 
                             if (slot.task->params.cache_prompt) {
-                                // reuse any previously computed tokens that are common with the new prompt
-                                n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
+                                // reuse any previously computed tokens that are common with the new prompt.
+                                // The scheduler (see ``get_available_slot``) already computed this LCP when
+                                // it picked the slot — use that snapshot when available to avoid walking
+                                // the token vector twice. Falls back to a fresh ``get_common_prefix`` if
+                                // the slot was picked by LRU (no scoring), or if the cached value somehow
+                                // exceeds the current input (defensive — shouldn't happen because the
+                                // slot stays idle between selection and update_slots).
+                                if (slot.lcp_at_select >= 0 &&
+                                    (size_t) slot.lcp_at_select <= input_tokens.size() &&
+                                    (size_t) slot.lcp_at_select <= slot.prompt.tokens.size()) {
+                                    n_past = (size_t) slot.lcp_at_select;
+                                } else {
+                                    n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
+                                }
 
                                 // if there is an alora invoked, don't cache after the invocation start
                                 if (slot.alora_invocation_start > 0) {
