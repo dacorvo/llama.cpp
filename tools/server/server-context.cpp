@@ -2440,8 +2440,22 @@ private:
                                     std::vector<splice_t> splices;
 
                                     // Two-pointer symmetric search.
+                                    //
+                                    // Donor positions must be backed by live KV cells. Long
+                                    // prefills can evict low-position cells (SWA window
+                                    // sliding past, n_ctx pressure during giant prompts) while
+                                    // slot.prompt.tokens still records every token. A
+                                    // candidate at hc < pos_min is matched by the token vector
+                                    // but the corresponding seq cells are gone; scheduling it
+                                    // would silently fail and break the post-splice batch
+                                    // invariant. Floor head_c_min at pos_min so the search
+                                    // only considers positions whose KV is still live.
+                                    const llama_pos cache_pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx), slot.id);
                                     size_t head_p     = n_past;
                                     size_t head_c_min = n_past; // monotonic floor — splices appear in order in cache
+                                    if (cache_pos_min > (llama_pos) head_c_min) {
+                                        head_c_min = (size_t) cache_pos_min;
+                                    }
                                     while (head_p + (size_t) n_cache_reuse <= input_tokens.size()) {
                                         // Find the first cache position >= head_c_min where a run of
                                         // length >= n_cache_reuse starts that matches input at head_p.
