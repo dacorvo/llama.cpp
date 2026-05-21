@@ -3149,13 +3149,41 @@ private:
                                                         llama_memory_seq_add(llama_get_memory(ctx), splice_temp,
                                                                              (llama_pos) best_hc, (llama_pos) (best_hc + best_n),
                                                                              pack_offset);
-                                                        SLT_INF(slot, "rung4 hydrate: snapshot slot %d, %.1f MiB read, %.2f ms\n",
-                                                                best_slot_id, (double) snap.data.size() / (1024.0 * 1024.0),
-                                                                (t_hydrate_end - t_hydrate_start) / 1e3);
-                                                        SLT_INF(slot, "cross-slot splice from snapshot (slot %d): size %zu, donor KV [%zu, %zu) -> recipient [%zu, %zu)\n",
-                                                                best_slot_id, best_n, best_hc, best_hc + best_n, head_p_x, head_p_x + best_n);
-                                                        splice_ok = true;
-                                                        host_hydrated = true;
+                                                        // Hybrid-SWA safety check: the public seq_pos_*
+                                                        // API returns the SWA cache's view (kv_swa).
+                                                        // If the chunk we hydrated isn't fully present
+                                                        // in the SWA cache (which happens on hybrid
+                                                        // models where the snapshot's SWA portion has
+                                                        // fewer cells than its base portion), the
+                                                        // cursor handler's seq_cp will only tag cells
+                                                        // in the base cache. Engine then sees seq.id
+                                                        // missing cells in SWA -> "Invalid input batch".
+                                                        // Rollback this host splice to keep the slot
+                                                        // batch valid.
+                                                        const llama_pos st_min_expected = (llama_pos) pack_offset + (llama_pos) best_hc;
+                                                        const llama_pos st_max_expected = (llama_pos) pack_offset + (llama_pos) best_hc + (llama_pos) best_n - 1;
+                                                        const llama_pos st_min_actual = llama_memory_seq_pos_min(llama_get_memory(ctx), splice_temp);
+                                                        const llama_pos st_max_actual = llama_memory_seq_pos_max(llama_get_memory(ctx), splice_temp);
+                                                        if (st_min_actual != st_min_expected || st_max_actual != st_max_expected) {
+                                                            SLT_WRN(slot, "rung4 hydrate: hybrid-SWA range mismatch for snapshot slot %d (splice_temp pos [%d, %d], expected [%d, %d]) — rolling back; disabling host splice for this request\n",
+                                                                    best_slot_id, st_min_actual, st_max_actual, st_min_expected, st_max_expected);
+                                                            llama_memory_seq_rm(llama_get_memory(ctx), splice_temp, -1, -1);
+                                                            // Set host_hydrated = true so the scan
+                                                            // skips remaining host candidates for
+                                                            // this request. In practice the same
+                                                            // hybrid-SWA issue will recur for any
+                                                            // host snapshot picked, so one failed
+                                                            // hydration is signal enough.
+                                                            host_hydrated = true;
+                                                        } else {
+                                                            SLT_INF(slot, "rung4 hydrate: snapshot slot %d, %.1f MiB read, %.2f ms\n",
+                                                                    best_slot_id, (double) snap.data.size() / (1024.0 * 1024.0),
+                                                                    (t_hydrate_end - t_hydrate_start) / 1e3);
+                                                            SLT_INF(slot, "cross-slot splice from snapshot (slot %d): size %zu, donor KV [%zu, %zu) -> recipient [%zu, %zu)\n",
+                                                                    best_slot_id, best_n, best_hc, best_hc + best_n, head_p_x, head_p_x + best_n);
+                                                            splice_ok = true;
+                                                            host_hydrated = true;
+                                                        }
                                                     }
                                                 } else {
                                                     server_slot & other = slots[best_slot_id];
