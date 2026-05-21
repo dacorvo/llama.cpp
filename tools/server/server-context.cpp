@@ -688,6 +688,29 @@ struct server_metrics {
 
 
 //
+// Per-slot K/V snapshot in host memory. Rung 4 phase 1: when a slot
+// finishes serving a request, ``llama_state_seq_get_data_ext`` dumps
+// the slot's seq state (cell positions + K/V tensor bytes) into
+// ``data``; the slot's tokens are kept alongside for later lookup.
+// This lets a sibling slot's cross-slot scan find a matching chunk
+// in the snapshot even after the donor slot's device cells have been
+// evicted to make room for new content.
+//
+// Wire format is llama.cpp's native ``state_seq`` format (see
+// llama-kv-cache.cpp:state_write / state_read). Handles MLA / SWA /
+// hybrid / variable-head-size models — the same serialiser used by
+// ``llama_state_seq_save_file``.
+//
+struct server_slot_snapshot {
+    bool                     occupied   = false;
+    int                      id_slot    = -1;
+    int64_t                  t_us       = 0;     // when the snapshot was taken
+    std::vector<uint8_t>     data;               // serialised seq state
+    llama_tokens             tokens;             // matching prompt.tokens (text-only)
+};
+
+
+//
 // Cross-slot k-gram index. Drops the cross-slot symmetric scan from
 // O(input × Σ donor_size) to O(input × candidates_per_kgram). Each
 // slot's ``prompt.tokens`` contributes one entry per k-gram (k = 16
@@ -870,6 +893,18 @@ private:
     // cross-slot symmetric scan (rebuilt for any slot whose
     // ``prompt.tokens.size()`` has changed since the last scan).
     server_kgram_index kgram_index;
+
+    // Per-slot host-resident K/V snapshots (rung 4 phase 1).
+    // Populated on slot release when ``cross_slot_cpu_tier`` is enabled.
+    // Phase 1 just snapshots; phase 2 will evict the device cells; phase
+    // 3 will let the cross-slot scan see these snapshots as donors.
+    std::vector<server_slot_snapshot> slot_snapshots;
+
+    // Env: LLAMA_CROSS_SLOT_CPU_TIER=1 enables host-tier snapshots on
+    // slot release. Defaults off until phases 2-4 land. Kept as an env
+    // var rather than a CLI flag during phased rollout; the public flag
+    // will land with step 6 once the full path is validated.
+    bool cross_slot_cpu_tier = false;
 
     int trace = 0;
     int slots_debug = 0;
@@ -1065,6 +1100,23 @@ private:
         }
 
         slots.clear();
+        slot_snapshots.clear();
+        slot_snapshots.resize(params_base.n_parallel);
+
+        // Rung 4 phase 1: opt-in via env var. Snapshot the slot's seq
+        // state to a host buffer when the slot is released, using
+        // llama.cpp's native ``llama_state_seq_get_data_ext`` (handles
+        // every memory backend the engine supports). Later phases will
+        // (2) evict the device cells after the snapshot, and (3) make
+        // the snapshots visible to the cross-slot symmetric scan as
+        // additional donors.
+        {
+            const char * env = std::getenv("LLAMA_CROSS_SLOT_CPU_TIER");
+            cross_slot_cpu_tier = env && env[0] != '0' && env[0] != '\0';
+            if (cross_slot_cpu_tier) {
+                SRV_INF("%s", "cross-slot CPU tier ENABLED (rung 4 phase 1) — slot K/V will be snapshotted to host RAM on release\n");
+            }
+        }
 
         const auto ctx_seq_rm_type = common_context_can_seq_rm(ctx);
         if (ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
@@ -1105,6 +1157,47 @@ private:
 
             slot.callback_on_release = [this](int id_slot) {
                 queue_tasks.pop_deferred_task(id_slot);
+
+                // Rung 4 phase 1: snapshot the slot's K/V to host RAM
+                // before subsequent requests overwrite it. We hook
+                // here because at this point the slot is IDLE and its
+                // K/V cells are still live on device (release() does
+                // not seq_rm them — they only get cleared when the
+                // next prefill on this slot calls memory_seq_rm).
+                if (!cross_slot_cpu_tier) return;
+                if (id_slot < 0 || (size_t) id_slot >= slots.size()) return;
+                if (id_slot >= (int) slot_snapshots.size()) return;
+
+                const server_slot & slot = slots[id_slot];
+                if (slot.prompt.tokens.empty())   return;
+                if (slot.prompt.tokens.has_mtmd)  return;
+
+                const int64_t t0 = ggml_time_us();
+                const size_t   n_bytes = llama_state_seq_get_size_ext(ctx, id_slot, 0);
+                if (n_bytes == 0) {
+                    SRV_WRN("rung4 snapshot: state_seq_get_size returned 0 for slot %d — skipping\n", id_slot);
+                    return;
+                }
+
+                auto & snap = slot_snapshots[id_slot];
+                snap.data.assign(n_bytes, 0);
+                const size_t n_written = llama_state_seq_get_data_ext(ctx, snap.data.data(), n_bytes, id_slot, 0);
+                if (n_written != n_bytes) {
+                    SRV_WRN("rung4 snapshot: state_seq_get_data wrote %zu of expected %zu bytes for slot %d — invalidating\n",
+                            n_written, n_bytes, id_slot);
+                    snap.data.clear();
+                    snap.occupied = false;
+                    return;
+                }
+                snap.tokens   = slot.prompt.tokens.get_text_tokens();
+                snap.id_slot  = id_slot;
+                snap.t_us     = ggml_time_us();
+                snap.occupied = true;
+                const int64_t t1 = ggml_time_us();
+
+                SRV_INF("rung4 snapshot: slot %d -> %zu bytes (%.1f MiB), %zu tokens, %.2f ms\n",
+                        id_slot, n_bytes, (double) n_bytes / (1024.0 * 1024.0),
+                        snap.tokens.size(), (t1 - t0) / 1e3);
             };
 
             slot.reset();
