@@ -725,6 +725,7 @@ struct server_kgram_index {
     struct entry {
         int32_t  slot_id;
         uint32_t pos;
+        bool     is_host;  // true: lives in slot_snapshots[slot_id]; false: live in slots[slot_id]
     };
 
     // hash -> all (slot_id, position) pairs whose k-gram at ``position``
@@ -734,16 +735,23 @@ struct server_kgram_index {
     std::unordered_map<uint64_t, std::vector<entry>> map;
 
     // Per-slot record of (size, has_mtmd) at the last refresh, so the
-    // next refresh can detect that this slot needs rebuilding.
+    // next refresh can detect that this slot needs rebuilding. Both
+    // the live-slot and host-snapshot versions are tracked
+    // independently so a slot with both live content and a prior
+    // snapshot indexes both.
     struct slot_state {
-        size_t   last_indexed_size = 0;
-        bool     has_mtmd          = false;
+        size_t   last_indexed_size      = 0;
+        bool     has_mtmd               = false;
+        size_t   last_host_indexed_size = 0;  // size of last host-tier snapshot indexed
     };
     std::vector<slot_state> slot_states;
 
     // Per-slot record of the hashes we inserted (indexed by position).
     // Used to remove this slot's entries from ``map`` cheaply on drop.
-    std::vector<std::vector<uint64_t>> slot_hashes;
+    // Separate vectors for live vs host so they can be invalidated
+    // independently.
+    std::vector<std::vector<uint64_t>> slot_hashes;       // live-slot entries
+    std::vector<std::vector<uint64_t>> slot_hashes_host;  // host-snapshot entries
 
     static uint64_t hash_kgram(const llama_token * tokens) {
         // FNV-1a 64-bit over the byte representation of K tokens.
@@ -758,11 +766,12 @@ struct server_kgram_index {
 
     void ensure_capacity(int32_t slot_id) {
         const size_t n = (size_t) slot_id + 1;
-        if (slot_states.size() < n) slot_states.resize(n);
-        if (slot_hashes.size() < n) slot_hashes.resize(n);
+        if (slot_states.size()      < n) slot_states.resize(n);
+        if (slot_hashes.size()      < n) slot_hashes.resize(n);
+        if (slot_hashes_host.size() < n) slot_hashes_host.resize(n);
     }
 
-    // Drop every entry for ``slot_id`` from ``map``.
+    // Drop every live-slot entry for ``slot_id`` from ``map``.
     void drop_slot(int32_t slot_id) {
         ensure_capacity(slot_id);
         auto & owned = slot_hashes[slot_id];
@@ -773,25 +782,47 @@ struct server_kgram_index {
             auto & vec = it->second;
             vec.erase(std::remove_if(vec.begin(), vec.end(),
                 [slot_id, pos](const entry & e) {
-                    return e.slot_id == slot_id && e.pos == pos;
+                    return e.slot_id == slot_id && e.pos == pos && !e.is_host;
                 }), vec.end());
             if (vec.empty()) map.erase(it);
         }
         owned.clear();
-        slot_states[slot_id] = {};
+        slot_states[slot_id].last_indexed_size = 0;
+        slot_states[slot_id].has_mtmd          = false;
     }
 
-    // Rebuild ``slot_id``'s entries from ``toks`` (full re-index).
+    // Drop every host-snapshot entry for ``slot_id`` from ``map``.
+    void drop_slot_host(int32_t slot_id) {
+        ensure_capacity(slot_id);
+        auto & owned = slot_hashes_host[slot_id];
+        for (uint32_t pos = 0; pos < owned.size(); pos++) {
+            const uint64_t h = owned[pos];
+            auto it = map.find(h);
+            if (it == map.end()) continue;
+            auto & vec = it->second;
+            vec.erase(std::remove_if(vec.begin(), vec.end(),
+                [slot_id, pos](const entry & e) {
+                    return e.slot_id == slot_id && e.pos == pos && e.is_host;
+                }), vec.end());
+            if (vec.empty()) map.erase(it);
+        }
+        owned.clear();
+        slot_states[slot_id].last_host_indexed_size = 0;
+    }
+
+    // Rebuild ``slot_id``'s live entries from ``toks`` (full re-index).
     void rebuild_slot(int32_t slot_id, const server_tokens & toks) {
         ensure_capacity(slot_id);
         drop_slot(slot_id);
         if (toks.has_mtmd) {
-            slot_states[slot_id] = {toks.size(), true};
+            slot_states[slot_id].last_indexed_size = toks.size();
+            slot_states[slot_id].has_mtmd         = true;
             return;
         }
         const size_t n = toks.size();
         if (n < K) {
-            slot_states[slot_id] = {n, false};
+            slot_states[slot_id].last_indexed_size = n;
+            slot_states[slot_id].has_mtmd         = false;
             return;
         }
         auto & owned = slot_hashes[slot_id];
@@ -802,22 +833,54 @@ struct server_kgram_index {
         for (size_t i = 0; i < n; i++) buf[i] = toks[i];
         for (uint32_t pos = 0; pos + K <= n; pos++) {
             const uint64_t h = hash_kgram(buf.data() + pos);
-            map[h].push_back({slot_id, pos});
+            map[h].push_back({slot_id, pos, /*is_host=*/false});
             owned[pos] = h;
         }
-        slot_states[slot_id] = {n, false};
+        slot_states[slot_id].last_indexed_size = n;
+        slot_states[slot_id].has_mtmd         = false;
     }
 
-    // Refresh every slot whose prompt.tokens size or has_mtmd flag has
-    // changed since the last refresh.
-    template <typename SlotsT>
-    void refresh(const SlotsT & slots) {
+    // Rebuild ``slot_id``'s host-snapshot entries from a raw token vector.
+    void rebuild_slot_host(int32_t slot_id, const llama_tokens & toks) {
+        ensure_capacity(slot_id);
+        drop_slot_host(slot_id);
+        const size_t n = toks.size();
+        if (n < K) {
+            slot_states[slot_id].last_host_indexed_size = n;
+            return;
+        }
+        auto & owned = slot_hashes_host[slot_id];
+        owned.resize(n - K + 1, 0);
+        for (uint32_t pos = 0; pos + K <= n; pos++) {
+            const uint64_t h = hash_kgram(toks.data() + pos);
+            map[h].push_back({slot_id, pos, /*is_host=*/true});
+            owned[pos] = h;
+        }
+        slot_states[slot_id].last_host_indexed_size = n;
+    }
+
+    // Refresh every slot whose prompt.tokens size, has_mtmd flag, or
+    // host snapshot size has changed since the last refresh.
+    template <typename SlotsT, typename SnapshotsT>
+    void refresh(const SlotsT & slots, const SnapshotsT & snapshots) {
         for (const auto & s : slots) {
             ensure_capacity(s.id);
             const auto & st = slot_states[s.id];
             if (st.last_indexed_size != s.prompt.tokens.size() ||
                 st.has_mtmd          != s.prompt.tokens.has_mtmd) {
                 rebuild_slot(s.id, s.prompt.tokens);
+            }
+        }
+        for (size_t i = 0; i < snapshots.size(); i++) {
+            const auto & snap = snapshots[i];
+            ensure_capacity((int32_t) i);
+            const size_t want = snap.occupied ? snap.tokens.size() : 0;
+            if (slot_states[i].last_host_indexed_size != want) {
+                if (snap.occupied) {
+                    rebuild_slot_host((int32_t) i, snap.tokens);
+                } else {
+                    drop_slot_host((int32_t) i);
+                }
             }
         }
     }
@@ -2943,11 +3006,11 @@ private:
                                         }
 
                                         // Refresh the server-wide k-gram index so all other
-                                        // slots' prompt.tokens are queryable in O(1) per input
-                                        // position. Replaces the prior O(R × Σ donor_size) nested
-                                        // scan with O(R × candidates_per_kgram) — typically a
-                                        // handful of candidates per hash bucket.
-                                        kgram_index.refresh(slots);
+                                        // slots' prompt.tokens AND host-resident snapshots are
+                                        // queryable in O(1) per input position. Replaces the
+                                        // prior O(R × Σ donor_size) nested scan with O(R ×
+                                        // candidates_per_kgram).
+                                        kgram_index.refresh(slots, slot_snapshots);
 
                                         // Materialise input into a contiguous buffer once; the
                                         // hash lookups below address it by pointer arithmetic.
@@ -2959,6 +3022,7 @@ private:
                                         constexpr size_t K_KGRAM = server_kgram_index::K;
                                         bool stop_cross_scan = false;
                                         size_t head_p_x = (size_t) n_past;
+                                        size_t n_host_skipped = 0;  // phase 3 telemetry
                                         while (!stop_cross_scan &&
                                                head_p_x + (size_t) n_cache_reuse <= input_tokens.size() &&
                                                head_p_x + K_KGRAM <= input_tokens.size()) {
@@ -2972,6 +3036,14 @@ private:
                                             int32_t best_slot_id = -1;
 
                                             for (const auto & cand : *cands) {
+                                                // Phase 4 will replace this skip with H2D hydration
+                                                // of the matched chunk into the splice temp seq;
+                                                // phase 3 just counts host hits for visibility.
+                                                if (cand.is_host) {
+                                                    n_host_skipped++;
+                                                    continue;
+                                                }
+
                                                 if (cand.slot_id == slot.id)                  continue;
                                                 if (cand.slot_id < 0)                         continue;
                                                 if ((size_t) cand.slot_id >= slots.size())    continue;
@@ -3045,6 +3117,11 @@ private:
                                             } else {
                                                 head_p_x++;
                                             }
+                                        }
+
+                                        if (n_host_skipped > 0) {
+                                            SLT_INF(slot, "cross-slot scan: %zu host-resident candidate(s) found, skipped (phase 4 hydration not yet wired)\n",
+                                                    n_host_skipped);
                                         }
 
                                         std::sort(slot.splice_pending.begin(), slot.splice_pending.end(),
