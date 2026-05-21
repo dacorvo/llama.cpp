@@ -1168,7 +1168,7 @@ private:
                 if (id_slot < 0 || (size_t) id_slot >= slots.size()) return;
                 if (id_slot >= (int) slot_snapshots.size()) return;
 
-                const server_slot & slot = slots[id_slot];
+                server_slot & slot = slots[id_slot];
                 if (slot.prompt.tokens.empty())   return;
                 if (slot.prompt.tokens.has_mtmd)  return;
 
@@ -1198,6 +1198,22 @@ private:
                 SRV_INF("rung4 snapshot: slot %d -> %zu bytes (%.1f MiB), %zu tokens, %.2f ms\n",
                         id_slot, n_bytes, (double) n_bytes / (1024.0 * 1024.0),
                         snap.tokens.size(), (t1 - t0) / 1e3);
+
+                // Phase 2: evict device cells. The snapshot has the
+                // full seq state in host RAM, so the on-device cells
+                // are now redundant — keeping them only inflates n_kv
+                // for other slots' prefill (the multi-slot tax we
+                // diagnosed). ``prompt_clear`` does both seq_rm and
+                // wipes ``slot.prompt.tokens`` so the next request to
+                // this slot is treated as cold (cache-reuse path won't
+                // CP against tokens whose cells are no longer there).
+                // Same-slot continuation will be restored in phase 4
+                // by hydrating from the snapshot.
+                const int64_t t_evict_start = ggml_time_us();
+                slot.prompt_clear(/*allow_processing=*/false);
+                const int64_t t_evict_end = ggml_time_us();
+                SRV_INF("rung4 evict: slot %d device cells removed, %.2f ms\n",
+                        id_slot, (t_evict_end - t_evict_start) / 1e3);
             };
 
             slot.reset();
