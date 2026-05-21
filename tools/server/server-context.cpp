@@ -3021,8 +3021,8 @@ private:
 
                                         constexpr size_t K_KGRAM = server_kgram_index::K;
                                         bool stop_cross_scan = false;
+                                        bool host_hydrated   = false;  // MVP: one host splice per request
                                         size_t head_p_x = (size_t) n_past;
-                                        size_t n_host_skipped = 0;  // phase 3 telemetry
                                         while (!stop_cross_scan &&
                                                head_p_x + (size_t) n_cache_reuse <= input_tokens.size() &&
                                                head_p_x + K_KGRAM <= input_tokens.size()) {
@@ -3034,94 +3034,161 @@ private:
                                             size_t  best_n       = 0;
                                             size_t  best_hc      = 0;
                                             int32_t best_slot_id = -1;
+                                            bool    best_is_host = false;
 
                                             for (const auto & cand : *cands) {
-                                                // Phase 4 will replace this skip with H2D hydration
-                                                // of the matched chunk into the splice temp seq;
-                                                // phase 3 just counts host hits for visibility.
-                                                if (cand.is_host) {
-                                                    n_host_skipped++;
-                                                    continue;
-                                                }
-
                                                 if (cand.slot_id == slot.id)                  continue;
                                                 if (cand.slot_id < 0)                         continue;
                                                 if ((size_t) cand.slot_id >= slots.size())    continue;
-                                                server_slot & other = slots[cand.slot_id];
-                                                if (other.is_processing())                    continue;
-                                                if (other.prompt.tokens.empty())              continue;
-                                                if (other.prompt.tokens.has_mtmd)             continue;
-                                                if ((size_t) cand.pos + K_KGRAM > other.prompt.tokens.size()) continue;
+
+                                                // Source the matching tokens (live slot vs host
+                                                // snapshot). Both look like a token vector for
+                                                // hash-collision check and match extension; only
+                                                // the splice-execution path differs further down.
+                                                const llama_token * donor_tokens = nullptr;
+                                                size_t              donor_size  = 0;
+                                                llama_pos           donor_pos_min = 0;
+                                                if (cand.is_host) {
+                                                    if (host_hydrated) continue;  // MVP: one host splice per request
+                                                    if ((size_t) cand.slot_id >= slot_snapshots.size()) continue;
+                                                    const auto & snap = slot_snapshots[cand.slot_id];
+                                                    if (!snap.occupied || snap.tokens.empty()) continue;
+                                                    if ((size_t) cand.pos + K_KGRAM > snap.tokens.size()) continue;
+                                                    donor_tokens  = snap.tokens.data();
+                                                    donor_size    = snap.tokens.size();
+                                                    donor_pos_min = 0; // snapshot has no eviction
+                                                } else {
+                                                    server_slot & other = slots[cand.slot_id];
+                                                    if (other.is_processing())                continue;
+                                                    if (other.prompt.tokens.empty())          continue;
+                                                    if (other.prompt.tokens.has_mtmd)         continue;
+                                                    if ((size_t) cand.pos + K_KGRAM > other.prompt.tokens.size()) continue;
+                                                    donor_size    = other.prompt.tokens.size();
+                                                    donor_pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx), other.id);
+                                                }
 
                                                 // Hash collision guard: exact-match the K-gram.
                                                 bool ok = true;
                                                 for (size_t i = 0; i < K_KGRAM; i++) {
-                                                    if (other.prompt.tokens[cand.pos + i] != input_tokens[head_p_x + i]) {
+                                                    const llama_token t =
+                                                        cand.is_host ? donor_tokens[cand.pos + i]
+                                                                     : slots[cand.slot_id].prompt.tokens[cand.pos + i];
+                                                    if (t != input_tokens[head_p_x + i]) {
                                                         ok = false; break;
                                                     }
                                                 }
                                                 if (!ok) continue;
 
-                                                // pos_min eviction guard: the donor may have lost
-                                                // low-position cells (SWA window slide, n_ctx
-                                                // pressure) — the index keeps stale entries until
-                                                // the slot's next refresh.
-                                                const llama_pos donor_pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx), other.id);
-                                                if ((llama_pos) cand.pos < donor_pos_min) continue;
+                                                // pos_min eviction guard (live-slot only).
+                                                if (!cand.is_host && (llama_pos) cand.pos < donor_pos_min) continue;
 
                                                 // Extend forward past the verified K-gram.
                                                 size_t n = K_KGRAM;
-                                                while (cand.pos + n < other.prompt.tokens.size() &&
-                                                       head_p_x + n < input_tokens.size()        &&
-                                                       !input_covered[head_p_x + n]              &&
-                                                       other.prompt.tokens[cand.pos + n] == input_tokens[head_p_x + n]) {
-                                                    n++;
+                                                if (cand.is_host) {
+                                                    while (cand.pos + n < donor_size                    &&
+                                                           head_p_x + n < input_tokens.size()           &&
+                                                           !input_covered[head_p_x + n]                 &&
+                                                           donor_tokens[cand.pos + n] == input_tokens[head_p_x + n]) {
+                                                        n++;
+                                                    }
+                                                } else {
+                                                    const server_slot & other = slots[cand.slot_id];
+                                                    while (cand.pos + n < other.prompt.tokens.size()    &&
+                                                           head_p_x + n < input_tokens.size()           &&
+                                                           !input_covered[head_p_x + n]                 &&
+                                                           other.prompt.tokens[cand.pos + n] == input_tokens[head_p_x + n]) {
+                                                        n++;
+                                                    }
                                                 }
                                                 if (n >= (size_t) n_cache_reuse && n > best_n) {
                                                     best_n       = n;
                                                     best_hc      = cand.pos;
                                                     best_slot_id = cand.slot_id;
+                                                    best_is_host = cand.is_host;
                                                 }
                                             }
 
                                             if (best_n >= (size_t) n_cache_reuse) {
-                                                server_slot & other = slots[best_slot_id];
                                                 constexpr llama_seq_id splice_temp = 255;
                                                 const llama_pos pack_offset = (llama_pos) server_slot_splice_pack_base;
-                                                const uint32_t n_cells = llama_memory_seq_cp_deep(
-                                                    llama_get_memory(ctx), other.id, splice_temp,
-                                                    (llama_pos) best_hc, (llama_pos) (best_hc + best_n),
-                                                    pack_offset);
-                                                if (n_cells > 0 && (size_t) n_cells == best_n) {
+                                                bool splice_ok = false;
+
+                                                if (best_is_host) {
+                                                    // Rung 4 phase 4: hydrate the host snapshot into
+                                                    // ``splice_temp`` at its original positions, trim
+                                                    // down to just the matched chunk, then shift to
+                                                    // packed positions. Hands off to the same
+                                                    // splice_pending cursor handler the intra-slot
+                                                    // and live-cross-slot paths use.
+                                                    const auto & snap = slot_snapshots[best_slot_id];
+
+                                                    llama_memory_seq_rm(llama_get_memory(ctx), splice_temp, -1, -1);
+                                                    const int64_t t_hydrate_start = ggml_time_us();
+                                                    const size_t n_read = llama_state_seq_set_data_ext(
+                                                        ctx, snap.data.data(), snap.data.size(), splice_temp, 0);
+                                                    const int64_t t_hydrate_end = ggml_time_us();
+                                                    if (n_read == 0 || n_read != snap.data.size()) {
+                                                        SLT_WRN(slot, "rung4 hydrate failed: state_seq_set_data read %zu of %zu bytes for slot %d snapshot\n",
+                                                                n_read, snap.data.size(), best_slot_id);
+                                                        llama_memory_seq_rm(llama_get_memory(ctx), splice_temp, -1, -1);
+                                                    } else {
+                                                        // Drop everything outside [best_hc, best_hc+best_n).
+                                                        if (best_hc > 0) {
+                                                            llama_memory_seq_rm(llama_get_memory(ctx), splice_temp,
+                                                                                0, (llama_pos) best_hc);
+                                                        }
+                                                        llama_memory_seq_rm(llama_get_memory(ctx), splice_temp,
+                                                                            (llama_pos) (best_hc + best_n), -1);
+                                                        // Shift the remaining chunk to packed positions
+                                                        // (same convention as the intra-slot path:
+                                                        // pack_base + head_c).
+                                                        llama_memory_seq_add(llama_get_memory(ctx), splice_temp,
+                                                                             (llama_pos) best_hc, (llama_pos) (best_hc + best_n),
+                                                                             pack_offset);
+                                                        SLT_INF(slot, "rung4 hydrate: snapshot slot %d, %.1f MiB read, %.2f ms\n",
+                                                                best_slot_id, (double) snap.data.size() / (1024.0 * 1024.0),
+                                                                (t_hydrate_end - t_hydrate_start) / 1e3);
+                                                        SLT_INF(slot, "cross-slot splice from snapshot (slot %d): size %zu, donor KV [%zu, %zu) -> recipient [%zu, %zu)\n",
+                                                                best_slot_id, best_n, best_hc, best_hc + best_n, head_p_x, head_p_x + best_n);
+                                                        splice_ok = true;
+                                                        host_hydrated = true;
+                                                    }
+                                                } else {
+                                                    server_slot & other = slots[best_slot_id];
+                                                    const uint32_t n_cells = llama_memory_seq_cp_deep(
+                                                        llama_get_memory(ctx), other.id, splice_temp,
+                                                        (llama_pos) best_hc, (llama_pos) (best_hc + best_n),
+                                                        pack_offset);
+                                                    if (n_cells > 0 && (size_t) n_cells == best_n) {
+                                                        SLT_INF(slot, "cross-slot splice from slot %d: size %zu, donor KV [%zu, %zu) -> recipient [%zu, %zu) (parked in TEMP_SEQ)\n",
+                                                                other.id, best_n, best_hc, best_hc + best_n, head_p_x, head_p_x + best_n);
+                                                        splice_ok = true;
+                                                    } else {
+                                                        SLT_WRN(slot, "seq_cp_deep returned %u (wanted %zu) — skipping cross-slot splice from slot %d at hc=%zu (likely cell pool exhausted)\n",
+                                                                n_cells, best_n, other.id, best_hc);
+                                                        // Pool exhausted: no later splice can land
+                                                        // either, abort the whole cross-slot scan.
+                                                        stop_cross_scan = true;
+                                                    }
+                                                }
+
+                                                if (splice_ok) {
                                                     server_splice sp{};
                                                     sp.head_c         = (llama_pos) best_hc;
                                                     sp.head_p         = (llama_pos) head_p_x;
                                                     sp.n_match        = (llama_pos) best_n;
                                                     sp.applied        = false;
-                                                    sp.donor_slot_id  = other.id;
+                                                    sp.donor_slot_id  = best_slot_id;
                                                     sp.pre_applied    = false;
                                                     slot.splice_pending.push_back(sp);
                                                     for (size_t i = 0; i < best_n; i++) {
                                                         input_covered[head_p_x + i] = true;
                                                     }
-                                                    SLT_INF(slot, "cross-slot splice from slot %d: size %zu, donor KV [%zu, %zu) -> recipient [%zu, %zu) (parked in TEMP_SEQ)\n",
-                                                            other.id, best_n, best_hc, best_hc + best_n, head_p_x, head_p_x + best_n);
                                                     head_p_x += best_n;
-                                                } else {
-                                                    SLT_WRN(slot, "seq_cp_deep returned %u (wanted %zu) — skipping cross-slot splice from slot %d at hc=%zu (likely cell pool exhausted)\n",
-                                                            n_cells, best_n, other.id, best_hc);
-                                                    // Pool exhausted: no later splice can land
-                                                    // either, abort the whole cross-slot scan.
-                                                    stop_cross_scan = true;
                                                 }
                                             } else {
                                                 head_p_x++;
                                             }
-                                        }
-
-                                        if (n_host_skipped > 0) {
-                                            SLT_INF(slot, "cross-slot scan: %zu host-resident candidate(s) found, skipped (phase 4 hydration not yet wired)\n",
-                                                    n_host_skipped);
                                         }
 
                                         std::sort(slot.splice_pending.begin(), slot.splice_pending.end(),
