@@ -1166,18 +1166,22 @@ private:
         slot_snapshots.clear();
         slot_snapshots.resize(params_base.n_parallel);
 
-        // Rung 4 phase 1: opt-in via env var. Snapshot the slot's seq
-        // state to a host buffer when the slot is released, using
-        // llama.cpp's native ``llama_state_seq_get_data_ext`` (handles
-        // every memory backend the engine supports). Later phases will
-        // (2) evict the device cells after the snapshot, and (3) make
-        // the snapshots visible to the cross-slot symmetric scan as
-        // additional donors.
+        // Rung 4: opt-in via ``--cross-slot-cpu-tier`` CLI flag (or
+        // legacy env var LLAMA_CROSS_SLOT_CPU_TIER for backwards
+        // compat). When enabled, the slot's seq state is snapshotted
+        // to host RAM on release using ``llama_state_seq_get_data_ext``;
+        // the device cells are then evicted; the cross-slot scan
+        // covers both live slots and host snapshots; and matched
+        // chunks are hydrated back to device on splice via
+        // ``llama_state_seq_set_data_ext``.
         {
-            const char * env = std::getenv("LLAMA_CROSS_SLOT_CPU_TIER");
-            cross_slot_cpu_tier = env && env[0] != '0' && env[0] != '\0';
+            cross_slot_cpu_tier = params_base.cross_slot_cpu_tier;
+            if (!cross_slot_cpu_tier) {
+                const char * env = std::getenv("LLAMA_CROSS_SLOT_CPU_TIER");
+                cross_slot_cpu_tier = env && env[0] != '0' && env[0] != '\0';
+            }
             if (cross_slot_cpu_tier) {
-                SRV_INF("%s", "cross-slot CPU tier ENABLED (rung 4 phase 1) — slot K/V will be snapshotted to host RAM on release\n");
+                SRV_INF("%s", "cross-slot CPU tier ENABLED — slot K/V will be snapshotted to host RAM on release, hydrated on cross-slot splice\n");
             }
         }
 

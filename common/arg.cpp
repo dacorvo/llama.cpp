@@ -1327,6 +1327,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_RAM").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
+        {"--cross-slot-cpu-tier"},
+        string_format("snapshot released slots' K/V to host RAM and hydrate on cross-slot splice (default: %s).\n"
+            "Eliminates the unified-pool n_kv tax for sibling slots' prefill at the cost of one PCIe transfer per cross-slot splice. Requires --kv-unified.",
+            params.cross_slot_cpu_tier ? "true" : "false"),
+        [](common_params & params) {
+            params.cross_slot_cpu_tier = true;
+        }
+    ).set_env("LLAMA_ARG_CROSS_SLOT_CPU_TIER").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
         "use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)",

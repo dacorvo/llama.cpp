@@ -250,21 +250,108 @@ before the recipient arrives.
 |------|------------------------------------|---------|--------|-------------|
 | 1    | plumb scheduler LCP                | ~30     | 0.5d   | done        |
 | 2    | cross-slot CP                      | ~80     | 1.0d   | done        |
-| 3a   | seq_cp_deep metadata scaffolding   | ~150    | 0.5d   | WIP         |
-| 3b   | seq_cp_deep K/V graph data move    | ~300-500| ~1w    | not started |
-| 3c   | cross-slot splice integration      | ~50     | 0.5d   | not started |
-| 4    | rolling-hash index                 | ~250    | 2-3d   | not started |
-| 5    | validation harness                 | small   | 1.0d   | not started |
-| 6    | flags + docs                       | small   | 0.5d   | not started |
-|      | **total**                          |         | ~2-3w  |             |
+| 3a   | seq_cp_deep metadata scaffolding   | ~150    | 0.5d   | done        |
+| 3b   | seq_cp_deep K/V graph data move    | ~150    | 1d     | done        |
+| 3c   | cross-slot splice integration      | ~150    | 0.5d   | done        |
+| 4    | rolling-hash index                 | ~225    | 1d     | done        |
+| 5    | validation harness                 | ~420    | 0.5d   | done        |
+| 6    | flags + docs                       | small   | 0.5d   | in progress |
+| R4.1 | rung 4 phase 1: D2H snapshot       | ~95     | 0.25d  | done        |
+| R4.2 | rung 4 phase 2: device eviction    | ~20     | 0.1d   | done        |
+| R4.3 | rung 4 phase 3: host kgram index   | ~100    | 0.5d   | done        |
+| R4.4 | rung 4 phase 4: H2D hydration      | ~115    | 0.5d   | done        |
+| R4.5 | rung 4 phase 5: validation rerun   | small   | 0.25d  | done        |
+|      | **total**                          |         |        |             |
 
-## Out of scope (rung 4)
+## Rung 3 results (on Gemma-4-E4B-it, real captured agentcap traces)
 
-- Persistent disk-backed cell store + hydration at boot.
-- Content-deduplicated chunk pool (instead of per-slot whole-context
-  buffers) — same hash index, but with cells stored once and
-  referenced by multiple "virtual slots."
+Validated on rung-3 multi-slot harness (`trace_analysis/replay_multislot.py`),
+2 captured (donor, recipient) pairs from a transformers-coding session:
 
-These build on rung 3's pool primitives, but require separate design
-work: serialization format for K/V tensors, model-version compat,
-disk → GPU hydration pipeline.
+| metric                                | cold     | rung-3 (cross-slot on) |
+|---------------------------------------|----------|------------------------|
+| recipient 0 prefill (chunk 69922 chars) | 20148 ms | **1271 ms (15.9x)**    |
+| recipient 1 prefill (chunk 41840 chars) | 36321 ms | **8178 ms (4.4x)**     |
+| cross-slot splices fired              | n/a      | 2/2 recipients         |
+
+Hash-index scan-time A/B (live-slot scan only, large donor):
+
+| scan mode | task        | scan time |
+|-----------|-------------|-----------|
+| linear    | task 26 (donor 1 vs donor 0's 50K toks) | 3321 ms |
+| hashed    | same task   | **29 ms (113x)** |
+
+## Rung 3 limitation: unified-KV n_kv tax
+
+A diagnosed structural cost (not specific to cross-slot splice): in
+unified KV mode, attention reads up to `n_kv = used_max_p1(pool)` cells
+per query token. With multiple slots' content in the pool, `n_kv`
+includes foreign-seq cells that get mask-zeroed but still cost compute.
+For donor warming on a non-empty pool, this manifests as ~1.8x per-batch
+slowdown for the duration of the prefill. Splice recipients pay
+negligible tax because they only run a handful of batches before
+falling out of prefill via the splice.
+
+Rung 4 addresses this directly: by parking idle slots' K/V in host RAM
+and evicting their device cells, the device pool stays small.
+
+## Rung 4 (done)
+
+CPU-tier cold storage for released slots' K/V. Enabled via
+``--cross-slot-cpu-tier`` (CLI) or ``LLAMA_CROSS_SLOT_CPU_TIER=1`` (env).
+
+Mechanism:
+- On slot release: ``llama_state_seq_get_data_ext`` dumps the slot's
+  seq state to a host buffer (~56 KB/token for E4B, all 26 layers ×
+  K + V at f16). Then ``prompt_clear`` evicts the device cells.
+- On cross-slot scan: ``server_kgram_index`` covers both live slots
+  AND host snapshots, distinguished by an ``is_host`` flag on each
+  candidate entry.
+- On host scan match: ``llama_state_seq_set_data_ext`` hydrates the
+  donor's full seq state into ``splice_temp`` at original positions,
+  ``seq_rm`` trims to the matched chunk, ``seq_add`` shifts to packed
+  positions, and the existing cursor handler lands the cells at
+  ``head_p`` exactly like the intra-slot/live-cross-slot paths.
+
+Measured on the same rung-3 harness, with ``--cross-slot-cpu-tier``:
+
+| metric                       | rung-3 only       | rung-4 (cpu tier) |
+|------------------------------|-------------------|--------------------|
+| donor 1 warm (74K tokens)    | 65294 ms (n_kv tax)| **37223 ms (cold-shape)** |
+| recipient 0 splice firing    | live slot 0       | host snapshot 0    |
+| recipient 0 prefill          | 1271 ms           | 3378 ms            |
+| host hydration time (50K)    | n/a               | 257 ms (2.8 GiB)   |
+
+Tradeoff: rung-4 trades device-resident pool tax (per-batch attention
+overhead) for one-shot PCIe hydration (per splice). Wins decisively in
+deployments where total session count × session size exceeds the device
+pool capacity. Neutral when everything fits on device (rung-3 alone is
+faster).
+
+### Rung 4 MVP limitations (future work)
+
+- **One host splice per request.** ``splice_temp`` (seq id 255) is
+  cleared by ``state_seq_set_data_ext`` on every hydration. A second
+  host splice in the same request would lose the first one. Multi-host
+  needs a small pool of temp seq ids, with the cursor handler keyed by
+  splice index.
+- **First-match selection.** The current scan commits the first host
+  candidate that crosses ``n_cache_reuse``; the globally-largest host
+  match might be at a later ``head_p``. Refining the selection (rank
+  all host candidates, pick the largest) is independent of the
+  multi-host fix.
+- **Full-snapshot hydration.** We load the donor's entire seq state
+  into ``splice_temp`` and then trim. A specialised partial-load API
+  on ``llama_state_seq_set_data`` (load only positions [p0, p1)) would
+  cut the hydration cost proportionally.
+
+## Out of scope (rung 5+)
+
+- Persistent disk-backed cell store. The native serialisation already
+  works (``llama_state_seq_save_file`` / ``_load_file``) — the missing
+  pieces are: eviction policy (host RAM → disk under memory pressure),
+  index of disk-resident snapshots (extend ``kgram_index`` further),
+  and warm-up at boot.
+- Content-deduplicated chunk pool. Same hash index, but storing each
+  chunk once instead of per-snapshot. Requires reference counting and
+  invalidation on session edits.
