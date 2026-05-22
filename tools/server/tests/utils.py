@@ -83,6 +83,7 @@ class ServerProcess:
     server_reranking: bool | None = False
     server_metrics: bool | None = False
     kv_unified: bool | None = False
+    rope_freq_base: float | None = None
     server_slots: bool | None = False
     pooling: str | None = None
     api_key: str | None = None
@@ -202,6 +203,8 @@ class ServerProcess:
             server_args.extend(["-ctk", self.ctk])
         if self.ctv:
             server_args.extend(["-ctv", self.ctv])
+        if self.rope_freq_base is not None:
+            server_args.extend(["--rope-freq-base", str(self.rope_freq_base)])
         if self.fa is not None:
             server_args.extend(["-fa", self.fa])
         if self.n_predict:
