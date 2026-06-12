@@ -13,6 +13,8 @@ add_library(${TARGET} STATIC
     server-queue.h
     server-common.cpp
     server-common.h
+    server-prefix-cache.cpp
+    server-prefix-cache.h
     server-context.cpp
     server-context.h
     server-tools.cpp

@@ -201,6 +201,8 @@ llama_build_and_test(test-chat-auto-parser.cpp WORKING_DIRECTORY ${PROJECT_SOURC
 llama_build_and_test(test-chat-template.cpp)
 llama_build_and_test(test-json-partial.cpp)
 llama_build_and_test(test-log.cpp)
+llama_build_and_test(test-server-prefix-cache.cpp ${PROJECT_SOURCE_DIR}/tools/server/server-prefix-cache.cpp)
+target_include_directories(test-server-prefix-cache PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
 llama_build_and_test(
     test-peg-parser.cpp
     peg-parser/simple-tokenize.cpp
