@@ -972,6 +972,44 @@ bool fs_create_directory_with_parents(const std::string & path) {
 #endif // _WIN32
 }
 
+uint64_t common_fnv1a(const void * data, size_t len, uint64_t seed) {
+    const uint8_t * bytes = static_cast<const uint8_t *>(data);
+
+    uint64_t h = seed;
+    for (size_t i = 0; i < len; ++i) {
+        h ^= bytes[i];
+        h *= 0x00000100000001b3ull;
+    }
+
+    return h;
+}
+
+uint64_t common_fnv1a(const void * data, size_t len) {
+    // FNV-1a 64-bit offset basis (same constants as common/jinja/utils.h `hasher`)
+    return common_fnv1a(data, len, 0xcbf29ce484222325ull);
+}
+
+uint64_t fs_file_id(const std::string & path) {
+    std::error_code ec;
+    const auto size       = std::filesystem::file_size(path, ec);
+    if (ec) {
+        return 0;
+    }
+    const auto write_time = std::filesystem::last_write_time(path, ec);
+    if (ec) {
+        return 0;
+    }
+
+    const uint64_t sz = (uint64_t) size;
+    const int64_t  mt = (int64_t) write_time.time_since_epoch().count();
+
+    uint64_t h = common_fnv1a(path.data(), path.size());
+    h = common_fnv1a(&sz, sizeof(sz), h);
+    h = common_fnv1a(&mt, sizeof(mt), h);
+
+    return h;
+}
+
 bool fs_is_directory(const std::string & path) {
     std::filesystem::path dir(path);
     return std::filesystem::exists(dir) && std::filesystem::is_directory(dir);

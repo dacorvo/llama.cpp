@@ -837,6 +837,13 @@ bool fs_is_directory(const std::string & path);
 std::string fs_get_cache_directory();
 std::string fs_get_cache_file(const std::string & filename);
 
+// FNV-1a 64-bit. Chain calls by passing a previous result as `seed`.
+uint64_t common_fnv1a(const void * data, size_t len);
+uint64_t common_fnv1a(const void * data, size_t len, uint64_t seed);
+
+// Fingerprint of a file's identity (path, size, mtime); 0 if it cannot be stat'd.
+uint64_t fs_file_id(const std::string & path);
+
 struct common_file_info {
     std::string path;
     std::string name;
