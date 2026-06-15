@@ -649,6 +649,7 @@ struct common_params {
 
     std::string slot_save_path;
     std::string prefix_cache_path; // directory for the cross-session prefix cache
+    int32_t     prefix_cache_size_mib = -1; // prefix cache dir size cap, -1 = no limit
     std::string media_path; // path to directory for loading media files
 
     float slot_prompt_similarity = 0.1f;

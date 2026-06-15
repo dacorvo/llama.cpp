@@ -3,6 +3,7 @@
 #include "common.h"
 #include "log.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <cstdio>
 #include <cstring>
@@ -245,9 +246,11 @@ bool prefix_cache_file_read_ckpt(
     return true;
 }
 
-server_prefix_cache::server_prefix_cache(std::string dir, uint64_t compat_id) :
-        dir_(std::move(dir)), compat_id_(compat_id) {
+// size_limit caps the directory in bytes (0 = no limit)
+server_prefix_cache::server_prefix_cache(std::string dir, uint64_t compat_id, size_t size_limit) :
+        dir_(std::move(dir)), compat_id_(compat_id), size_limit_(size_limit) {
     GGML_ASSERT(compat_id_ != 0);
+    enforce_limits(); // prune stale / over-cap / torn files before indexing
     build_index();
     worker_ = std::thread(&server_prefix_cache::writer_loop, this);
 }
@@ -261,6 +264,13 @@ server_prefix_cache::~server_prefix_cache() {
     if (worker_.joinable()) {
         worker_.join();
     }
+}
+
+void server_prefix_cache::record_hit(const std::string & path) {
+    ++n_hit_;
+    // bump mtime so LRU eviction sees this entry as recently used (reads don't)
+    std::error_code ec;
+    std::filesystem::last_write_time(path, std::filesystem::file_time_type::clock::now(), ec);
 }
 
 void server_prefix_cache::async_save(prefix_cache_entry && entry) {
@@ -299,6 +309,61 @@ void server_prefix_cache::build_index() {
     }
 
     LOG_INF("%s: indexed %zu prefix cache entr%s\n", __func__, index_.size(), index_.size() == 1 ? "y" : "ies");
+}
+
+void server_prefix_cache::enforce_limits() {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+
+    struct file_info {
+        std::string        path;
+        uintmax_t          size;
+        fs::file_time_type mtime;
+    };
+
+    std::vector<file_info> entries;
+    uintmax_t total = 0;
+
+    // span the whole dir by mtime (global last-hit), so a superseded model's cold
+    // entries are reclaimed for the current one, not just our own compat_id
+    for (const auto & de : fs::directory_iterator(dir_, ec)) {
+        const auto & path = de.path();
+        const auto   ext  = path.extension();
+
+        if (ext == ".tmp") {
+            fs::remove(path, ec); // leftover from an interrupted write
+            continue;
+        }
+        if (ext != ".ggpc" || !de.is_regular_file()) {
+            continue;
+        }
+
+        const uintmax_t size = fs::file_size(path, ec);
+        if (ec) {
+            continue;
+        }
+        const fs::file_time_type mtime = fs::last_write_time(path, ec);
+        if (ec) {
+            continue;
+        }
+
+        entries.push_back({ path.string(), size, mtime });
+        total += size;
+    }
+
+    // size cap: evict the least recently hit (oldest mtime) until under the limit
+    if (size_limit_ > 0 && total > size_limit_) {
+        std::sort(entries.begin(), entries.end(),
+            [](const file_info & a, const file_info & b) { return a.mtime < b.mtime; });
+        for (const auto & f : entries) {
+            if (total <= size_limit_) {
+                break;
+            }
+            fs::remove(f.path, ec);
+            total -= f.size;
+            ++n_evict_;
+        }
+    }
 }
 
 const prefix_cache_index_entry * server_prefix_cache::lookup(
@@ -349,6 +414,10 @@ void server_prefix_cache::writer_loop() {
         if (ec) {
             LOG_WRN("%s: failed to rename %s -> %s (%s)\n", __func__, tmp.c_str(), path.c_str(), ec.message().c_str());
             std::filesystem::remove(tmp, ec);
+            continue;
         }
+
+        ++n_capture_;
+        enforce_limits(); // keep the dir within the cap after adding an entry
     }
 }

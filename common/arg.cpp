@@ -3110,6 +3110,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--prefix-cache-size"}, "N",
+        string_format("size cap for the prefix cache directory in MiB, -1 = no limit (default: %d)", params.prefix_cache_size_mib),
+        [](common_params & params, int value) {
+            params.prefix_cache_size_mib = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--media-path"}, "PATH",
         "directory for loading local media files; files can be accessed via file:// URLs using relative paths (default: disabled)",
         [](common_params & params, const std::string & value) {

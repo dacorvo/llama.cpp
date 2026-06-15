@@ -117,6 +117,23 @@ Here is an example trace of an API request for text completion:
 - As the response is stateless, `server_res_generator` calls `response->update()` to update the response with the current state.
 - `server_res_generator` then calls `response->to_json()` and passes the response to the HTTP layer.
 
+### Prefix cache
+
+The prefix cache (`--prefix-cache-path`, `server_prefix_cache`) persists recurring
+first-turn prompt prefixes (system prompt + first user turn) to disk, so a cold start
+or a RAM-cache miss can reuse them across server restarts and sessions. It is a tier
+below the in-RAM prompt cache, not a replacement: a disk entry is only consulted when
+the RAM path leaves the slot with no reusable prefix.
+
+It is off by default — entries are external files written to a user-chosen directory,
+so enabling it is opt-in. Entries are the full serialized KV state and scale with
+prefix length × model KV size (hundreds of MB for a long prefix), so on a long-running
+server set `--prefix-cache-size N` (MiB) to bound the directory; eviction is LRU across
+the whole directory, so a superseded model's cold entries are reclaimed too. The cache
+only pays off when first-turn prefixes are stable and recur — the `prefix_cache_*`
+counters in `/metrics` (hit / miss / capture / evict) show whether that holds for a
+given deployment.
+
 ### Testing
 
 `llama-server` includes an automated test suite based on `pytest`.

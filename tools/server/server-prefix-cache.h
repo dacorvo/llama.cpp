@@ -2,6 +2,7 @@
 
 #include "llama.h"
 
+#include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
@@ -108,7 +109,7 @@ bool prefix_cache_file_read_ckpt(
 // duplicating. compat_id must be non-zero.
 class server_prefix_cache {
 public:
-    server_prefix_cache(std::string dir, uint64_t compat_id);
+    server_prefix_cache(std::string dir, uint64_t compat_id, size_t size_limit);
     ~server_prefix_cache();
 
     server_prefix_cache(const server_prefix_cache &)             = delete;
@@ -122,13 +123,23 @@ public:
     const prefix_cache_index_entry * lookup(const std::vector<llama_token> & prompt,
                                              int32_t max_tokens) const;
 
+    void record_hit(const std::string & path); // counts a hit and touches the file's mtime
+    void record_miss() { ++n_miss_; }
+
+    uint64_t n_hit()     const { return n_hit_; }
+    uint64_t n_miss()    const { return n_miss_; }
+    uint64_t n_capture() const { return n_capture_; }
+    uint64_t n_evict()   const { return n_evict_; }
+
 private:
     void writer_loop();
     void build_index();
+    void enforce_limits(); // filesystem-only: prune .tmp, stale, and over-cap entries
     std::string path_for(const prefix_cache_entry & entry) const;
 
     const std::string dir_;
     const uint64_t    compat_id_;
+    const size_t      size_limit_; // 0 = no limit
 
     // built once at construction; read-only afterwards (no live captures added)
     std::vector<prefix_cache_index_entry> index_;
@@ -138,4 +149,9 @@ private:
     std::queue<prefix_cache_entry> queue_;
     bool                           stop_ = false;
     std::thread                    worker_;
+
+    std::atomic<uint64_t> n_hit_{0};
+    std::atomic<uint64_t> n_miss_{0};
+    std::atomic<uint64_t> n_capture_{0};
+    std::atomic<uint64_t> n_evict_{0};
 };

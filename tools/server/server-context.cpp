@@ -1147,8 +1147,10 @@ private:
             if (compat_id == 0) {
                 SRV_WRN("prefix cache disabled: cannot identify model file '%s'\n", params_base.model.path.c_str());
             } else {
+                const size_t size_limit = params_base.prefix_cache_size_mib > 0
+                    ? (size_t) params_base.prefix_cache_size_mib * 1024 * 1024 : 0;
                 SRV_INF("prefix cache is enabled, path: %s\n", params_base.prefix_cache_path.c_str());
-                prefix_cache = std::make_unique<server_prefix_cache>(params_base.prefix_cache_path, compat_id);
+                prefix_cache = std::make_unique<server_prefix_cache>(params_base.prefix_cache_path, compat_id, size_limit);
             }
         }
 
@@ -2145,6 +2147,7 @@ private:
 
         const auto * e = prefix_cache->lookup(tokens_new.get_text_tokens(), slot.n_ctx);
         if (e == nullptr) {
+            prefix_cache->record_miss();
             return false;
         }
 
@@ -2160,6 +2163,7 @@ private:
             SLT_WRN(slot, "failed to restore prefix cache entry %s\n", e->path.c_str());
             common_context_seq_rm(ctx_tgt, slot.id, -1, -1);
             slot.prompt.tokens.clear();
+            prefix_cache->record_miss();
             return false;
         }
 
@@ -2183,6 +2187,9 @@ private:
 
             slot.prompt.checkpoints.push_back(std::move(ckpt));
         }
+
+        // touch-on-hit (mtime) so LRU eviction treats this entry as recently used
+        prefix_cache->record_hit(e->path);
 
         SLT_INF(slot, "restored prefix cache entry (n_tokens = %d, checkpoints = %zu)\n",
                 (int) e->header.tokens.size(), slot.prompt.checkpoints.size());
@@ -2341,6 +2348,13 @@ private:
 
                     res->n_decode_total          = metrics.n_decode_total;
                     res->n_busy_slots_total      = metrics.n_busy_slots_total;
+
+                    if (prefix_cache) {
+                        res->prefix_cache_hit     = prefix_cache->n_hit();
+                        res->prefix_cache_miss    = prefix_cache->n_miss();
+                        res->prefix_cache_capture = prefix_cache->n_capture();
+                        res->prefix_cache_evict   = prefix_cache->n_evict();
+                    }
 
                     if (task.metrics_reset_bucket) {
                         metrics.reset_bucket();
@@ -4164,6 +4178,22 @@ void server_routes::init_routes() {
                     {"name",  "n_tokens_max"},
                     {"help",  "Largest observed n_tokens."},
                     {"value",  res_task->n_tokens_max}
+            }, {
+                    {"name",  "prefix_cache_hit_total"},
+                    {"help",  "Number of disk prefix cache hits."},
+                    {"value",  res_task->prefix_cache_hit}
+            }, {
+                    {"name",  "prefix_cache_miss_total"},
+                    {"help",  "Number of disk prefix cache misses."},
+                    {"value",  res_task->prefix_cache_miss}
+            }, {
+                    {"name",  "prefix_cache_capture_total"},
+                    {"help",  "Number of prefixes captured to the disk cache."},
+                    {"value",  res_task->prefix_cache_capture}
+            }, {
+                    {"name",  "prefix_cache_evict_total"},
+                    {"help",  "Number of disk prefix cache entries evicted."},
+                    {"value",  res_task->prefix_cache_evict}
             }}},
             {"gauge", {{
                     {"name",  "prompt_tokens_seconds"},

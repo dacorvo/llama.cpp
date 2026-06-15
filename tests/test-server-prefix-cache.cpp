@@ -155,6 +155,88 @@ int main() {
         std::filesystem::remove(pg);
     }
 
+    // runtime cache: async_save drains on shutdown, then build_index + lookup find the entries
+    {
+        const std::filesystem::path cdir = dir / "test-pc-runtime";
+        std::filesystem::remove_all(cdir);
+        std::filesystem::create_directory(cdir);
+        const std::string cpath = cdir.string() + "/";
+
+        auto count_ggpc = [&]() {
+            int n = 0;
+            for (const auto & de : std::filesystem::directory_iterator(cdir)) {
+                if (de.path().extension() == ".ggpc") { n++; }
+            }
+            return n;
+        };
+
+        {
+            server_prefix_cache cache(cpath, cid, 0);
+            for (int i = 0; i < 3; ++i) {
+                prefix_cache_entry e;
+                e.tokens = { 1, 2, 3, 100 + i }; // shared {1,2,3} prefix, distinct tail
+                e.main   = { (uint8_t) i };
+                cache.async_save(std::move(e));
+            }
+        } // destructor drains the writer queue and joins
+
+        CHECK(count_ggpc() == 3, "async_save drained 3 entries on shutdown");
+
+        {
+            server_prefix_cache cache(cpath, cid, 0); // reopen: index rebuilt from disk
+
+            const auto * e_exact = cache.lookup({ 1, 2, 3, 101 }, 1 << 20);
+            CHECK(e_exact && e_exact->header.tokens == std::vector<llama_token>({ 1, 2, 3, 101 }),
+                  "lookup returns the longest-common-prefix match");
+
+            const auto * e_part = cache.lookup({ 1, 2, 3, 999 }, 1 << 20);
+            CHECK(e_part && e_part->header.tokens.size() >= 3 &&
+                  e_part->header.tokens[0] == 1 && e_part->header.tokens[1] == 2 && e_part->header.tokens[2] == 3,
+                  "lookup falls back to a shorter shared prefix");
+
+            CHECK(cache.lookup({ 7, 8, 9 },      1 << 20) == nullptr, "lookup: no shared prefix returns null");
+            CHECK(cache.lookup({ 1, 2, 3, 101 }, 3)       == nullptr, "lookup: entries over the token cap are skipped");
+        }
+
+        std::filesystem::remove_all(cdir);
+    }
+
+    // enforce_limits: the size cap evicts oldest, .tmp leftovers are cleaned
+    {
+        const std::filesystem::path cdir = dir / "test-pc-evict";
+        std::filesystem::remove_all(cdir);
+        std::filesystem::create_directory(cdir);
+        const std::string cpath = cdir.string() + "/";
+
+        auto count_ggpc = [&]() {
+            int n = 0;
+            for (const auto & de : std::filesystem::directory_iterator(cdir)) {
+                if (de.path().extension() == ".ggpc") { n++; }
+            }
+            return n;
+        };
+
+        {
+            server_prefix_cache cache(cpath, cid, 0); // no limit
+            for (int i = 0; i < 3; ++i) {
+                prefix_cache_entry e;
+                e.tokens = { i };
+                e.main.assign(2000, (uint8_t) i); // ~2 KiB each
+                cache.async_save(std::move(e));
+            }
+        }
+        CHECK(count_ggpc() == 3, "3 entries written under no limit");
+
+        { std::ofstream f(cpath + "stray.ggpc.tmp", std::ios::binary); f << "torn"; }
+
+        { server_prefix_cache cache(cpath, cid, 3000); } // cap fits ~1 entry; ctor prunes
+
+        CHECK(!std::filesystem::exists(cpath + "stray.ggpc.tmp"), "enforce_limits cleans .tmp leftovers");
+        CHECK(count_ggpc() == 1, "size cap evicts down to the limit");
+
+        std::filesystem::remove_all(cdir);
+    }
+
     std::filesystem::remove(path_entry);
     std::filesystem::remove(path_model);
 
