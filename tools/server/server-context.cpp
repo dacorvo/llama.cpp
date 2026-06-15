@@ -2164,9 +2164,28 @@ private:
         }
 
         slot.prompt.tokens = server_tokens(e->header.tokens, false);
-        slot.prompt.checkpoints.clear();
 
-        SLT_INF(slot, "restored prefix cache entry (n_tokens = %d)\n", (int) e->header.tokens.size());
+        // reload checkpoints to allow slot rewind on a shorter prefix on SWA/recurrent
+        slot.prompt.checkpoints.clear();
+        for (size_t i = 0; i < e->header.checkpoints.size(); ++i) {
+            const auto & m = e->header.checkpoints[i];
+
+            common_prompt_checkpoint ckpt;
+            ckpt.pos_min  = m.pos_min;
+            ckpt.pos_max  = m.pos_max;
+            ckpt.n_tokens = m.n_tokens;
+            ckpt.data_tgt.resize(m.size);
+
+            if (!prefix_cache_file_read_ckpt(e->path, e->header, i, ckpt.data_tgt.data())) {
+                SLT_WRN(slot, "failed to read checkpoint %zu from prefix cache entry\n", i);
+                break; // keep what we read; the rewind tolerates a subset
+            }
+
+            slot.prompt.checkpoints.push_back(std::move(ckpt));
+        }
+
+        SLT_INF(slot, "restored prefix cache entry (n_tokens = %d, checkpoints = %zu)\n",
+                (int) e->header.tokens.size(), slot.prompt.checkpoints.size());
 
         return true;
     }
