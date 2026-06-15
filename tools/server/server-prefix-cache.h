@@ -2,9 +2,13 @@
 
 #include "llama.h"
 
+#include <condition_variable>
 #include <cstdint>
 #include <functional>
+#include <mutex>
+#include <queue>
 #include <string>
+#include <thread>
 #include <vector>
 
 // On-disk format for a server prefix-cache entry ("ggpc"). Server-owned framing of
@@ -91,3 +95,32 @@ bool prefix_cache_file_read_ckpt(
     const prefix_cache_header & header,
                        size_t   i,
                       uint8_t * dst);
+
+// Runtime owner of the on-disk prefix cache: writes captured snapshots to `dir`
+// from a background thread, so decoding never blocks on disk. Entries are
+// content-addressed, so a recurring prefix overwrites its own file rather than
+// duplicating. compat_id must be non-zero.
+class server_prefix_cache {
+public:
+    server_prefix_cache(std::string dir, uint64_t compat_id);
+    ~server_prefix_cache();
+
+    server_prefix_cache(const server_prefix_cache &)             = delete;
+    server_prefix_cache & operator=(const server_prefix_cache &) = delete;
+
+    // Queue an entry for an asynchronous write; compat_id is stamped here.
+    void async_save(prefix_cache_entry && entry);
+
+private:
+    void writer_loop();
+    std::string path_for(const prefix_cache_entry & entry) const;
+
+    const std::string dir_;
+    const uint64_t    compat_id_;
+
+    std::mutex                     mtx_;
+    std::condition_variable        cv_;
+    std::queue<prefix_cache_entry> queue_;
+    bool                           stop_ = false;
+    std::thread                    worker_;
+};

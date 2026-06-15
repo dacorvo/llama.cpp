@@ -1,8 +1,12 @@
 #include "server-prefix-cache.h"
 
 #include "common.h"
+#include "log.h"
 
+#include <cinttypes>
+#include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 
 #ifndef _WIN32
@@ -230,4 +234,71 @@ bool prefix_cache_file_read_ckpt(
     }
 
     return true;
+}
+
+server_prefix_cache::server_prefix_cache(std::string dir, uint64_t compat_id) :
+        dir_(std::move(dir)), compat_id_(compat_id) {
+    GGML_ASSERT(compat_id_ != 0);
+    worker_ = std::thread(&server_prefix_cache::writer_loop, this);
+}
+
+server_prefix_cache::~server_prefix_cache() {
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        stop_ = true;
+    }
+    cv_.notify_all();
+    if (worker_.joinable()) {
+        worker_.join();
+    }
+}
+
+void server_prefix_cache::async_save(prefix_cache_entry && entry) {
+    entry.compat_id = compat_id_;
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        queue_.push(std::move(entry));
+    }
+    cv_.notify_one();
+}
+
+std::string server_prefix_cache::path_for(const prefix_cache_entry & entry) const {
+    // content-addressed on (compat_id, tokens): identical prefixes map to the same file
+    const uint64_t h = common_fnv1a(entry.tokens.data(), entry.tokens.size() * sizeof(llama_token), compat_id_);
+    char name[32];
+    snprintf(name, sizeof(name), "%016" PRIx64 ".ggpc", h);
+    return dir_ + name;
+}
+
+void server_prefix_cache::writer_loop() {
+    while (true) {
+        prefix_cache_entry entry;
+        {
+            std::unique_lock<std::mutex> lk(mtx_);
+            cv_.wait(lk, [this] { return stop_ || !queue_.empty(); });
+            if (queue_.empty()) {
+                return; // reached only once stop_ is set and the queue has drained
+            }
+            entry = std::move(queue_.front());
+            queue_.pop();
+        }
+
+        const std::string path = path_for(entry);
+        const std::string tmp  = path + ".tmp";
+
+        // .tmp + rename so a startup scan never sees a torn file
+        if (prefix_cache_file_save(tmp, entry) == 0) {
+            LOG_WRN("%s: failed to write prefix cache entry %s\n", __func__, tmp.c_str());
+            std::error_code ec;
+            std::filesystem::remove(tmp, ec);
+            continue;
+        }
+
+        std::error_code ec;
+        std::filesystem::rename(tmp, path, ec);
+        if (ec) {
+            LOG_WRN("%s: failed to rename %s -> %s (%s)\n", __func__, tmp.c_str(), path.c_str(), ec.message().c_str());
+            std::filesystem::remove(tmp, ec);
+        }
+    }
 }

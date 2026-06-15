@@ -2,6 +2,7 @@
 #include "server-context.h"
 #include "server-chat.h"
 #include "server-common.h"
+#include "server-prefix-cache.h"
 #include "server-http.h"
 #include "server-task.h"
 #include "server-queue.h"
@@ -705,6 +706,8 @@ private:
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
+    std::unique_ptr<server_prefix_cache> prefix_cache;
+
     server_metrics metrics;
 
     json json_ui_settings = json::object();    // Primary: new name
@@ -1131,6 +1134,22 @@ private:
                     params_base.n_ctx_checkpoints, params_base.checkpoint_min_step);
         } else {
             SRV_INF("%s", "context checkpoints disabled\n");
+        }
+
+        if (!params_base.prefix_cache_path.empty()) {
+            const uint64_t compat_id = prefix_cache_compat_id(
+                    params_base.model.path,
+                    params_base.cache_type_k,
+                    params_base.cache_type_v,
+                    params_base.swa_full,
+                    params_base.kv_unified);
+
+            if (compat_id == 0) {
+                SRV_WRN("prefix cache disabled: cannot identify model file '%s'\n", params_base.model.path.c_str());
+            } else {
+                SRV_INF("prefix cache is enabled, path: %s\n", params_base.prefix_cache_path.c_str());
+                prefix_cache = std::make_unique<server_prefix_cache>(params_base.prefix_cache_path, compat_id);
+            }
         }
 
         if (!params_base.model_alias.empty()) {
@@ -2052,6 +2071,59 @@ private:
                 "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                 (int) slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, cur.pos_min,
                 cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
+    }
+
+    // Synchronous device->host snapshot of the slot's prefix state: the main blob
+    // plus the already host-resident checkpoints. This is the TTFT cost.
+    prefix_cache_entry snapshot_prefix_device_to_host(const server_slot & slot) {
+        prefix_cache_entry entry;
+
+        entry.tokens = slot.prompt.tokens.get_text_tokens();
+
+        const size_t main_size = llama_state_seq_get_size_ext(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        entry.main.resize(main_size);
+        llama_state_seq_get_data_ext(ctx_tgt, entry.main.data(), main_size, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+
+        entry.checkpoints.reserve(slot.prompt.checkpoints.size());
+        for (const auto & c : slot.prompt.checkpoints) {
+            entry.checkpoints.push_back({ c.pos_min, c.pos_max, c.n_tokens, c.data_tgt });
+        }
+
+        return entry;
+    }
+
+    // Capture the slot's end-of-prefill state into the disk prefix cache.
+    void capture_prefix(server_slot & slot) {
+        if (!prefix_cache) {
+            return;
+        }
+
+        // persisting a multi-turn state costs more to restore than the small shared
+        // prefix it would reuse
+        if (!slot.task->params.first_turn) {
+            return;
+        }
+
+        if (slot.task->type != SERVER_TASK_TYPE_COMPLETION) {
+            return;
+        }
+
+        // capture only on the parent, else each n_cmpl child re-snapshots the same prefix
+        if (slot.task->id_parent != -1) {
+            return;
+        }
+
+        // a multimodal prompt can't be a raw token array; it would restore as garbage
+        if (slot.prompt.tokens.has_mtmd) {
+            return;
+        }
+
+        prefix_cache_entry entry = snapshot_prefix_device_to_host(slot);
+
+        SLT_INF(slot, "snapshot prefix cache entry (n_tokens = %d, main = %.3f MiB, checkpoints = %zu)\n",
+                (int) entry.tokens.size(), (float) entry.main.size() / 1024 / 1024, entry.checkpoints.size());
+
+        prefix_cache->async_save(std::move(entry));
     }
 
     void process_single_task(server_task && task) {
@@ -3347,6 +3419,9 @@ private:
                     // prompt evaluated for next-token prediction
                     slot.state = SLOT_STATE_GENERATING;
 
+                    // end of prefill, before any decode
+                    capture_prefix(slot);
+
                     if (slot.can_speculate()) {
                         common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
                     }
@@ -3738,6 +3813,9 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                         ctx_server.vocab,
                         ctx_server.mctx);
             }
+
+            // raw completions carry no messages, so default to first-turn
+            task.params.first_turn = json_value(data, "first_turn", true);
 
             task.id_slot = json_value(data, "id_slot", -1);
 

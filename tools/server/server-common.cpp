@@ -1110,6 +1110,16 @@ json oaicompat_chat_params_parse(
         llama_params["chat_parser"] = chat_params.parser;
     }
 
+    // determine if this is the first turn, before templating discards message roles
+    bool first_turn = true;
+    for (const auto & msg : inputs.messages) {
+        if (msg.role == "assistant") {
+            first_turn = false;
+            break;
+        }
+    }
+    llama_params["first_turn"] = first_turn;
+
     llama_params["message_spans"] = json::array();
 
     for (const auto & span : chat_params.message_spans) {

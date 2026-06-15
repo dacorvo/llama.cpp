@@ -3096,6 +3096,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--prefix-cache-path"}, "PATH",
+        "directory for the cross-session prefix cache, persisting recurring prompt prefixes to disk (default: disabled)",
+        [](common_params & params, const std::string & value) {
+            params.prefix_cache_path = value;
+            if (!fs_is_directory(params.prefix_cache_path)) {
+                throw std::invalid_argument("not a directory: " + value);
+            }
+            // if doesn't end with DIRECTORY_SEPARATOR, add it
+            if (!params.prefix_cache_path.empty() && params.prefix_cache_path[params.prefix_cache_path.size() - 1] != DIRECTORY_SEPARATOR) {
+                params.prefix_cache_path += DIRECTORY_SEPARATOR;
+            }
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--media-path"}, "PATH",
         "directory for loading local media files; files can be accessed via file:// URLs using relative paths (default: disabled)",
         [](common_params & params, const std::string & value) {

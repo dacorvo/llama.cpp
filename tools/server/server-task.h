@@ -65,6 +65,9 @@ struct task_params {
     // number of prompt tokens before the latest user message
     int32_t n_before_user = -1;
 
+    // the request carries no prior assistant message; gates prefix-cache capture
+    bool first_turn = false;
+
     int64_t t_max_prompt_ms  = -1; // TODO: implement
     int64_t t_max_predict_ms = -1; // if positive, limit the generation phase to this time limit
 
