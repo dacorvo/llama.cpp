@@ -70,6 +70,12 @@ struct prefix_cache_header {
     uint64_t main_size   = 0;
 };
 
+// An indexed entry: a file path plus its header, kept resident for lookup.
+struct prefix_cache_index_entry {
+    std::string         path;
+    prefix_cache_header header;
+};
+
 // Write `entry` to `path` (truncates). Returns bytes written, 0 on I/O failure.
 // entry.compat_id must be non-zero (asserted) - a caller without a usable compat
 // id should not be capturing at all.
@@ -111,12 +117,21 @@ public:
     // Queue an entry for an asynchronous write; compat_id is stamped here.
     void async_save(prefix_cache_entry && entry);
 
+    // Longest-common-prefix match for `prompt`, or nullptr. Skips entries over
+    // `max_tokens` (won't fit) and any with no shared prefix.
+    const prefix_cache_index_entry * lookup(const std::vector<llama_token> & prompt,
+                                             int32_t max_tokens) const;
+
 private:
     void writer_loop();
+    void build_index();
     std::string path_for(const prefix_cache_entry & entry) const;
 
     const std::string dir_;
     const uint64_t    compat_id_;
+
+    // built once at construction; read-only afterwards (no live captures added)
+    std::vector<prefix_cache_index_entry> index_;
 
     std::mutex                     mtx_;
     std::condition_variable        cv_;

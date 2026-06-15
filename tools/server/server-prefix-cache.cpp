@@ -24,6 +24,15 @@ constexpr uint32_t PREFIX_CACHE_VERSION = 1;
 constexpr uint32_t PREFIX_CACHE_MAX_TOKENS = 16u*1024*1024;
 constexpr uint32_t PREFIX_CACHE_MAX_CKPTS  = 4096;
 
+int common_prefix_len(const std::vector<llama_token> & a, const std::vector<llama_token> & b) {
+    const size_t n = std::min(a.size(), b.size());
+    size_t i = 0;
+    while (i < n && a[i] == b[i]) {
+        ++i;
+    }
+    return (int) i;
+}
+
 } // namespace
 
 uint64_t prefix_cache_compat_id(
@@ -239,6 +248,7 @@ bool prefix_cache_file_read_ckpt(
 server_prefix_cache::server_prefix_cache(std::string dir, uint64_t compat_id) :
         dir_(std::move(dir)), compat_id_(compat_id) {
     GGML_ASSERT(compat_id_ != 0);
+    build_index();
     worker_ = std::thread(&server_prefix_cache::writer_loop, this);
 }
 
@@ -268,6 +278,46 @@ std::string server_prefix_cache::path_for(const prefix_cache_entry & entry) cons
     char name[32];
     snprintf(name, sizeof(name), "%016" PRIx64 ".ggpc", h);
     return dir_ + name;
+}
+
+void server_prefix_cache::build_index() {
+    std::error_code ec;
+    for (const auto & de : std::filesystem::directory_iterator(dir_, ec)) {
+        if (!de.is_regular_file() || de.path().extension() != ".ggpc") {
+            continue;
+        }
+
+        prefix_cache_header header;
+        if (!prefix_cache_file_peek(de.path().string(), header)) {
+            continue; // foreign / corrupt / truncated - skip, don't fail the scan
+        }
+        if (header.compat_id != compat_id_) {
+            continue; // built for a different model / KV config
+        }
+
+        index_.push_back({ de.path().string(), std::move(header) });
+    }
+
+    LOG_INF("%s: indexed %zu prefix cache entr%s\n", __func__, index_.size(), index_.size() == 1 ? "y" : "ies");
+}
+
+const prefix_cache_index_entry * server_prefix_cache::lookup(
+        const std::vector<llama_token> & prompt, int32_t max_tokens) const {
+    const prefix_cache_index_entry * best = nullptr;
+    int best_lcp = 0;
+
+    for (const auto & e : index_) {
+        if ((int32_t) e.header.tokens.size() > max_tokens) {
+            continue; // would not fit the slot's context
+        }
+        const int lcp = common_prefix_len(e.header.tokens, prompt);
+        if (lcp > best_lcp) {
+            best_lcp = lcp;
+            best     = &e;
+        }
+    }
+
+    return best;
 }
 
 void server_prefix_cache::writer_loop() {

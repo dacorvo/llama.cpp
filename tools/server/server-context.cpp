@@ -1392,6 +1392,13 @@ private:
 
                 SRV_INF("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
             }
+
+            // disk tier: only when the RAM path left no reusable prefix, so the restore
+            // never discards a host->device sync the RAM cache just made
+            if (prefix_cache && task.type == SERVER_TASK_TYPE_COMPLETION &&
+                ret->prompt.tokens.get_common_prefix(task.tokens) == 0) {
+                prefix_load(*ret, task.tokens);
+            }
         }
 
         return ret;
@@ -2104,6 +2111,13 @@ private:
             return;
         }
 
+        // capture cold or substantially-novel first turns; skip near-exact re-occurrences
+        // already covered by an entry (this also re-captures a drifted prompt, e.g. an
+        // edited system prompt, that only partially matched)
+        if (slot.n_prompt_tokens_cache * 10 >= slot.task->n_tokens() * 9) { // >= 90% reused
+            return;
+        }
+
         if (slot.task->type != SERVER_TASK_TYPE_COMPLETION) {
             return;
         }
@@ -2124,6 +2138,37 @@ private:
                 (int) entry.tokens.size(), (float) entry.main.size() / 1024 / 1024, entry.checkpoints.size());
 
         prefix_cache->async_save(std::move(entry));
+    }
+
+    bool prefix_load(server_slot & slot, const server_tokens & tokens_new) {
+        GGML_ASSERT(prefix_cache);
+
+        const auto * e = prefix_cache->lookup(tokens_new.get_text_tokens(), slot.n_ctx);
+        if (e == nullptr) {
+            return false;
+        }
+
+        // drop any state left in this sequence before restoring
+        common_context_seq_rm(ctx_tgt, slot.id, -1, -1);
+
+        const bool ok = prefix_cache_file_read_main(e->path, e->header,
+            [&](const uint8_t * data, size_t size) {
+                return llama_state_seq_set_data_ext(ctx_tgt, data, size, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE) == size;
+            });
+
+        if (!ok) {
+            SLT_WRN(slot, "failed to restore prefix cache entry %s\n", e->path.c_str());
+            common_context_seq_rm(ctx_tgt, slot.id, -1, -1);
+            slot.prompt.tokens.clear();
+            return false;
+        }
+
+        slot.prompt.tokens = server_tokens(e->header.tokens, false);
+        slot.prompt.checkpoints.clear();
+
+        SLT_INF(slot, "restored prefix cache entry (n_tokens = %d)\n", (int) e->header.tokens.size());
+
+        return true;
     }
 
     void process_single_task(server_task && task) {
