@@ -23,6 +23,30 @@ The cache reuses the recurring prefix; benefit scales with its length.
 | qwen3.6-35B (recurrent) · pi| 845 ms     | 268 ms (3.2×)          | 383 ms (2.2×)    | 2.2–3.2×       | 157 MiB    |
 | gemma-4-26B (SWA) · hermes  | 1,960 ms   | 465 ms (4.2×)          | —                | 4.2× (≤9.5×)   | ~1 GiB     |
 
+## M2 / Apple Silicon (gemma-4-E4B, Metal) — the actual target
+
+Hardware: Apple M2, 24 GB unified, Metal. Model: gemma-4-E4B-it Q4_K_M (SWA) — the
+effective-4B variant, so entries are ~6× smaller than the 26B-A4B above (70 MiB vs
+433 MiB for the pi prefix). Same method (client TTFT, restart before each warm request).
+
+| model / agent          | cold (med) | warm (med) | speedup              | entry  | hits  |
+|------------------------|-----------:|-----------:|----------------------|-------:|-------|
+| gemma-4-E4B (SWA) · pi | 6,533 ms   | 523 ms     | **12.5×** (8.5–13.4×) | 70 MiB | 10/10 |
+
+This is the use case the feature was built for. Cold prefill is the bottleneck on M2 —
+a ~1,692-token agent prefix takes ~6.5 s — and the disk cache turns restart/cold-start
+TTFT into ~0.5 s. The speedup scales *inversely* with prefill speed: the A10G's 2.1×
+(pi) is the weak case (fast hardware needs this least); slow-prefill hardware (Apple
+Silicon, consumer GPUs, CPU) gets the largest win.
+
+10 distinct pi tasks, **one** captured entry: they share the agent system prefix, so
+the first turn captures it and the rest reuse it via the SWA checkpoint rewind — one
+entry serves the whole agent's first-turn traffic.
+
+The small-prompt regression / ~500-tok break-even (below) was measured on A10G; on M2
+the per-token prefill is far slower, so the break-even drops and the regression should
+largely disappear — **not yet measured on M2** (goose-small/hermes on E4B not run).
+
 ## Costs (measured)
 
 - **Capture penalty: ~0 ms** on TTFT (device→host snapshot is fast; the disk write is async).
