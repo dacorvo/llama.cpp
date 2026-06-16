@@ -1,7 +1,9 @@
 import json,time,glob,subprocess,urllib.request,os,shutil,sys
-PORT=8090; DIR="/home/ubuntu/llama.cpp/bench/pc/"
+PORT=8090
+ROOT=os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DIR=os.path.join(ROOT,"bench","pc")+os.sep
 MODEL=sys.argv[1]; ALIAS=sys.argv[2]
-REQ=json.load(open(sorted(glob.glob("/home/ubuntu/llama.cpp/bench/reqs2/r*.json"))[0]))["req"]
+REQ=json.load(open(sorted(glob.glob(os.path.join(ROOT,"bench","reqs2","r*.json")))[0]))["req"]
 def kill():
     subprocess.run(["pkill","-f","build/bin/llama-server"],stderr=subprocess.DEVNULL)
     for _ in range(60):
@@ -10,7 +12,7 @@ def kill():
 def launch():
     subprocess.Popen(["./build/bin/llama-server","-ngl","99","--ctx-size","8192","--metrics","-np","1",
       "--host","127.0.0.1","--port",str(PORT),"--alias",ALIAS,"--prefix-cache-path",DIR,"-m",MODEL],
-      cwd="/home/ubuntu/llama.cpp",stdout=open("/tmp/srv_cd.log","w"),stderr=subprocess.STDOUT,
+      cwd=ROOT,stdout=open("/tmp/srv_cd.log","w"),stderr=subprocess.STDOUT,
       env=dict(os.environ,CUDA_VISIBLE_DEVICES="0"))
     for _ in range(300):
         try: urllib.request.urlopen(f"http://127.0.0.1:{PORT}/health",timeout=2); return
@@ -37,6 +39,6 @@ sz=os.path.getsize(DIR+os.listdir(DIR)[0])//(1024*1024)
 launch(); h0=hits(); tw=send(); hw=hits()-h0; kill()
 # COLD disk: launch, drop OS page cache, first request -> blob read from disk
 launch()
-subprocess.run(["sudo","sh","-c","echo 3 > /proc/sys/vm/drop_caches"])
+subprocess.run(["sudo","purge"] if sys.platform=="darwin" else ["sudo","sh","-c","echo 3 > /proc/sys/vm/drop_caches"])
 h0=hits(); tc=send(); hc=hits()-h0; kill()
 print(f"{ALIAS}: entry={sz}MiB  warm(pagecache)={tw:.0f}ms hit={hw}  cold-disk(dropped)={tc:.0f}ms hit={hc}")

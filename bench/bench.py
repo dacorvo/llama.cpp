@@ -1,9 +1,9 @@
 import json, time, glob, subprocess, urllib.request, sys, os, shutil, signal
 
 PORT=8090
-DIR="/home/ubuntu/llama.cpp/bench/pc/"
-import os as _os
-RDIR=sys.argv[3] if len(sys.argv)>3 else "/home/ubuntu/llama.cpp/bench/reqs2"
+ROOT=os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DIR=os.path.join(ROOT,"bench","pc")+os.sep
+RDIR=sys.argv[3] if len(sys.argv)>3 else os.path.join(ROOT,"bench","reqs2")
 REQS=[json.load(open(p)) for p in sorted(glob.glob(RDIR+"/r*.json"))]
 
 def kill():
@@ -17,7 +17,7 @@ def launch(model, alias):
     subprocess.Popen(["./build/bin/llama-server","-ngl","99","--ctx-size","12288","--metrics",
         "-np","1","--host","127.0.0.1","--port",str(PORT),"--alias",alias,
         "--prefix-cache-path",DIR,"-m",model],
-        cwd="/home/ubuntu/llama.cpp", stdout=open("/tmp/srv_bench.log","w"), stderr=subprocess.STDOUT, env=env)
+        cwd=ROOT, stdout=open("/tmp/srv_bench.log","w"), stderr=subprocess.STDOUT, env=env)
     for _ in range(200):
         try: urllib.request.urlopen(f"http://127.0.0.1:{PORT}/health",timeout=2); return
         except Exception: time.sleep(1)

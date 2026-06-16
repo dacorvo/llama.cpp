@@ -36,8 +36,15 @@ disk cache can serve a recurring prefix.
 
 ## Reproduce
 
+Paths are derived from the script location (run from anywhere); the first arg is the
+model `.gguf`. Works on CUDA (`CUDA_VISIBLE_DEVICES=0`) or Apple Metal (`-ngl 99`);
+`colddisk.py` drops the page cache via `sudo purge` on macOS, `drop_caches` on Linux.
+
 ```bash
-# from repo root, model loaded on GPU 0
+# gemma-4 E4B (Apple Metal) — point -m at your cached gguf
+python3 bench/bench.py "$(echo ~/.cache/huggingface/hub/models--ggml-org--gemma-4-E4B-it-GGUF/snapshots/*/gemma-4-E4B-it-Q4_K_M.gguf)" gemma bench/reqs2
+
+# original A10G (CUDA) runs
 python3 bench/bench.py models/gemma-4-26b-a4b/gemma-4-26B-A4B-it-UD-Q4_K_M.gguf gemma bench/reqs_hermes
 python3 bench/bench.py models/qwen3.6-35b-a3b/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf  qwen  bench/reqs2
 ```
