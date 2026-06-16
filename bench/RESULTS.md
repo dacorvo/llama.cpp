@@ -39,7 +39,24 @@ ones (pi/opencode/hermes). The win is real and **grows with prefix length** (pre
 cost grows ~linearly with tokens; restore I/O grows far slower): pi ~2–3×, hermes ~4×
 (up to 9.5×).
 
+### Small-prompt regression (goose sub-floor) — measured
+
+Small goose first-turn prompts (~200–650 tok), gemma-26B, exact recurrence (each
+restores its own entry, 10/10 hits):
+
+| | cold | warm | speedup |
+|---|------|------|---------|
+| median | 271 ms | 304 ms | **0.89× (regression)** |
+
+The warm path has a **~300 ms fixed floor** (lookup + ~100–200 MiB `set_data` upload +
+first decode); cold prefill scales with prompt size. **Break-even ≈ 500 tok**: below it
+restore is slower than prefill, so the cache makes TTFT **10–30% worse**. The
+negative-value-restore guard (planned Step-4 cost model: skip restore when est. cost >
+prefill saved) is **not implemented**, so short prompts regress rather than fail safe.
+This is a second floor, distinct from the 256-tok checkpoint floor.
+
 Honest bounds:
+- **Add a min-reuse guard before shipping** — without it, short prompts regress (above).
 - Value materializes **only when RAM is cold** — post-restart / cold-start / autoscale /
   model-swap. A warm long-lived server already gets this from the RAM cache (~106 ms
   slot reuse); the disk cache adds nothing in steady state. Payoff ∝ restart frequency.
